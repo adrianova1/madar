@@ -44,7 +44,7 @@ const RoomActionSchema = z.discriminatedUnion('action', [
   }),
 ]);
 
-function sanitizePublicRoom(row: Record<string, unknown>) {
+function sanitizePublicRoom(row: Record<string, unknown>, viewerUserId: number) {
   const players = JSON.parse(String(row.players_json || '[]')) as RoomPlayer[];
   const votes = JSON.parse(String(row.votes_json || '{}')) as Record<string, string>;
   const channelLog = JSON.parse(String(row.channel_log_json || '[]')) as ChannelEvent[];
@@ -61,7 +61,7 @@ function sanitizePublicRoom(row: Record<string, unknown>) {
       id: p.id,
       name: p.name,
       alive: p.alive,
-      isCurrentUser: Boolean(p.userId),
+      isCurrentUser: p.userId === viewerUserId,
     })),
     votes,
     channelLog,
@@ -70,6 +70,11 @@ function sanitizePublicRoom(row: Record<string, unknown>) {
 }
 
 export async function GET(req: NextRequest) {
+  const auth = getAuthUser(req);
+  if (!auth) {
+    return NextResponse.json({ error: 'برای مشاهده اتاق همگام تلگرام ابتدا وارد حساب شوید.' }, { status: 401 });
+  }
+
   const db = getDb();
   const roomCode = req.nextUrl.searchParams.get('roomCode')?.trim().toUpperCase();
 
@@ -78,13 +83,19 @@ export async function GET(req: NextRequest) {
       | Record<string, unknown>
       | undefined;
     if (!row) return NextResponse.json({ error: 'اتاق بازی با این کد یافت نشد.' }, { status: 404 });
-    return NextResponse.json({ room: sanitizePublicRoom(row) });
+    const players = JSON.parse(String(row.players_json || '[]')) as RoomPlayer[];
+    const isAuthorized =
+      Number(row.host_user_id) === auth.id || players.some((p) => p.userId === auth.id);
+    if (!isAuthorized) {
+      return NextResponse.json({ error: 'دسترسی به این اتاق همگام برای شما مجاز نیست.' }, { status: 403 });
+    }
+    return NextResponse.json({ room: sanitizePublicRoom(row, auth.id) });
   }
 
   const recent = db
-    .prepare("SELECT * FROM game_rooms WHERE status = 'active' ORDER BY id DESC LIMIT 6")
-    .all() as Record<string, unknown>[];
-  return NextResponse.json({ rooms: recent.map(sanitizePublicRoom) });
+    .prepare("SELECT * FROM game_rooms WHERE host_user_id = ? AND status = 'active' ORDER BY id DESC LIMIT 6")
+    .all(auth.id) as Record<string, unknown>[];
+  return NextResponse.json({ rooms: recent.map((r) => sanitizePublicRoom(r, auth.id)) });
 }
 
 export async function POST(req: NextRequest) {
@@ -132,12 +143,12 @@ export async function POST(req: NextRequest) {
       },
       {
         channel: 'telegram_group',
-        text: `دکمه‌های شیشه‌ای رأی‌گیری در گروه «${d.groupTitle || 'کهکشان دوستان مدار'}» آماده شد.`,
+        text: `رأی‌گیری همگام برای گروه «${d.groupTitle || 'گروه تلگرام'}» آماده شد.`,
         at: nowStr,
       },
       {
         channel: 'bot_dm',
-        text: 'نقش مخفی هر بازیکن فقط از طریق پی‌وی امن ربات قابل مشاهده است.',
+        text: 'نقش مخفی هر بازیکن فقط به‌صورت خصوصی نمایش داده می‌شود.',
         at: nowStr,
       },
     ];
@@ -145,10 +156,10 @@ export async function POST(req: NextRequest) {
     db.prepare(`
       INSERT INTO game_rooms (room_code, game_type, host_user_id, group_chat_id, phase, day_number, players_json, votes_json, channel_log_json)
       VALUES (?, ?, ?, ?, 'VOTING', 1, ?, '{}', ?)
-    `).run(roomCode, d.gameType, auth.id, d.groupTitle || 'کهکشان دوستان مدار', JSON.stringify(players), JSON.stringify(initialLog));
+    `).run(roomCode, d.gameType, auth.id, d.groupTitle || 'گروه تلگرام', JSON.stringify(players), JSON.stringify(initialLog));
 
     const row = db.prepare('SELECT * FROM game_rooms WHERE room_code = ?').get(roomCode) as Record<string, unknown>;
-    return NextResponse.json({ ok: true, room: sanitizePublicRoom(row) }, { status: 201 });
+    return NextResponse.json({ ok: true, room: sanitizePublicRoom(row, auth.id) }, { status: 201 });
   }
 
   const row = db.prepare('SELECT * FROM game_rooms WHERE room_code = ?').get(d.roomCode.toUpperCase()) as
@@ -156,20 +167,27 @@ export async function POST(req: NextRequest) {
     | undefined;
   if (!row) return NextResponse.json({ error: 'اتاق موردنظر یافت نشد.' }, { status: 404 });
 
+  const isHost = Number(row.host_user_id) === auth.id;
   const players = JSON.parse(String(row.players_json || '[]')) as RoomPlayer[];
+  const isParticipant = isHost || players.some((p) => p.userId === auth.id);
+  if (!isParticipant) {
+    return NextResponse.json({ error: 'شما عضو یا میزبان این اتاق همگام نیستید.' }, { status: 403 });
+  }
+
   const votes = JSON.parse(String(row.votes_json || '{}')) as Record<string, string>;
   const channelLog = JSON.parse(String(row.channel_log_json || '[]')) as ChannelEvent[];
 
   if (d.action === 'request_dm_role') {
-    // Strictly only allow viewing the authenticated user's own seat (or host's seat p_1)
     const seat = players.find((p) => p.id === d.playerId);
     if (!seat) return NextResponse.json({ error: 'بازیکن یافت نشد.' }, { status: 404 });
-    if (seat.userId && seat.userId !== auth.id) {
+    // Strict role authorization: owned seat can only be viewed by its owner; unowned seat only by the room host
+    const canViewSeat = seat.userId ? seat.userId === auth.id : isHost;
+    if (!canViewSeat) {
       return NextResponse.json({ error: 'دسترسی به نقش مخفی بازیکن دیگر مجاز نیست.' }, { status: 403 });
     }
     const meta = MAFIA_ROLE_META[seat.role];
     const nextLog: ChannelEvent[] = [
-      { channel: 'bot_dm', text: `نقش محرمانه به پی‌وی ${seat.name} تحویل داده شد (در گروه نمایش داده نمی‌شود).`, at: nowStr },
+      { channel: 'bot_dm', text: `نقش محرمانه به پی‌وی ${seat.name} تحویل داده شد.`, at: nowStr },
       ...channelLog.slice(0, 14),
     ];
     db.prepare("UPDATE game_rooms SET channel_log_json = ?, updated_at = datetime('now') WHERE room_code = ?").run(
@@ -194,11 +212,14 @@ export async function POST(req: NextRequest) {
     if (!voter || !target) {
       return NextResponse.json({ error: 'رأی‌دهنده یا هدف انتخابی در بازی زنده نیست.' }, { status: 400 });
     }
+    if (!isHost && voter.userId !== auth.id) {
+      return NextResponse.json({ error: 'فقط می‌توانید به‌نام خودتان یا به‌عنوان میزبان رأی ثبت کنید.' }, { status: 403 });
+    }
     votes[voter.id] = target.id;
     const nextLog: ChannelEvent[] = [
       {
         channel: d.channel,
-        text: `${voter.name} از طریق ${d.channel === 'telegram_group' ? 'دکمه شیشه‌ای گروه تلگرام' : 'مینی‌اپ'} به «${target.name}» رأی داد.`,
+        text: `${voter.name} از طریق ${d.channel === 'telegram_group' ? 'گروه تلگرام' : 'مینی‌اپ'} به «${target.name}» رأی داد.`,
         at: nowStr,
       },
       ...channelLog.slice(0, 14),
@@ -209,10 +230,13 @@ export async function POST(req: NextRequest) {
       d.roomCode.toUpperCase()
     );
     const updated = db.prepare('SELECT * FROM game_rooms WHERE room_code = ?').get(d.roomCode.toUpperCase()) as Record<string, unknown>;
-    return NextResponse.json({ ok: true, room: sanitizePublicRoom(updated) });
+    return NextResponse.json({ ok: true, room: sanitizePublicRoom(updated, auth.id) });
   }
 
   if (d.action === 'resolve_votes') {
+    if (!isHost) {
+      return NextResponse.json({ error: 'فقط میزبان اتاق می‌تواند رأی‌گیری را ببندد.' }, { status: 403 });
+    }
     const tally = new Map<string, number>();
     for (const targetId of Object.values(votes)) {
       tally.set(targetId, (tally.get(targetId) ?? 0) + 1);
@@ -231,7 +255,7 @@ export async function POST(req: NextRequest) {
       const victim = players.find((p) => p.id === topId);
       if (victim) {
         victim.alive = false;
-        summary = `با ${topCount} رأی همگام، «${victim.name}» از شهر خارج شد و شب جدید آغاز شد.`;
+        summary = `با ${topCount} رأی همگام، «${victim.name}» از شهر خارج شد.`;
       }
     }
 
@@ -245,7 +269,7 @@ export async function POST(req: NextRequest) {
     ).run(nextDay, JSON.stringify(players), JSON.stringify(nextLog), d.roomCode.toUpperCase());
 
     const updated = db.prepare('SELECT * FROM game_rooms WHERE room_code = ?').get(d.roomCode.toUpperCase()) as Record<string, unknown>;
-    return NextResponse.json({ ok: true, room: sanitizePublicRoom(updated), message: summary });
+    return NextResponse.json({ ok: true, room: sanitizePublicRoom(updated, auth.id), message: summary });
   }
 
   return NextResponse.json({ error: 'عملیات نامعتبر' }, { status: 400 });

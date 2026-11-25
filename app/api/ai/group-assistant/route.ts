@@ -2,26 +2,30 @@ import { NextRequest, NextResponse } from 'next/server';
 import { z } from 'zod';
 import { getDb } from '@/lib/db';
 import { checkRateLimit, getAuthUser, getClientIp } from '@/lib/security';
-import { askMadarGroupAssistant } from '@/lib/gemini';
+import { generateLocalGroupReply } from '@/lib/moderation-engine';
 
-const AssistantReqSchema = z.object({
+const LocalAssistantReqSchema = z.object({
   groupId: z.number().int().positive().default(1),
   message: z.string().min(1, 'پیام نمی‌تواند خالی باشد').max(500),
 });
 
 export async function POST(req: NextRequest) {
-  const ip = getClientIp(req);
   const auth = getAuthUser(req);
-  const rl = checkRateLimit(`ai:${auth?.id ?? ip}`, 15, 10 * 60 * 1000);
+  if (!auth) {
+    return NextResponse.json({ error: 'احراز هویت الزامی است.' }, { status: 401 });
+  }
+
+  const ip = getClientIp(req);
+  const rl = checkRateLimit(`local_group_bot:${auth.id}:${ip}`, 25, 10 * 60 * 1000);
   if (!rl.allowed) {
     return NextResponse.json(
-      { error: `محدودیت نرخ درخواست هوش مصنوعی فعال شد. لطفاً ${rl.retryAfterSec} ثانیه دیگر تلاش کنید.` },
+      { error: `تعداد درخواست‌ها زیاد است. ${rl.retryAfterSec} ثانیه صبر کنید.` },
       { status: 429 }
     );
   }
 
   const body = await req.json().catch(() => null);
-  const parsed = AssistantReqSchema.safeParse(body);
+  const parsed = LocalAssistantReqSchema.safeParse(body);
   if (!parsed.success) {
     return NextResponse.json({ error: parsed.error.issues[0]?.message || 'پیام نامعتبر است.' }, { status: 400 });
   }
@@ -31,12 +35,16 @@ export async function POST(req: NextRequest) {
     | {
         id: number;
         title: string;
+        owner_user_id: number | null;
+        rules_text: string;
+        welcome_text: string;
+        anti_link: number;
+        anti_ads: number;
+        anti_spam: number;
+        anti_flood: number;
+        anti_tabchi: number;
+        lock_media: number;
         ai_enabled: number;
-        ai_humor_level: string;
-        ai_max_reply_chars: number;
-        ai_daily_limit: number;
-        ai_used_today: number;
-        ai_allowed_topics: string;
       }
     | undefined;
 
@@ -44,59 +52,47 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: 'گروه موردنظر یافت نشد.' }, { status: 404 });
   }
 
-  if (!group.ai_enabled) {
-    return NextResponse.json({ error: 'دستیار هوش مصنوعی در تنظیمات این گروه غیرفعال است.' }, { status: 403 });
-  }
-
-  if (group.ai_used_today >= group.ai_daily_limit) {
-    return NextResponse.json({ error: 'سقف مصرف روزانه هوش مصنوعی این گروه به پایان رسیده است.' }, { status: 429 });
-  }
-
-  try {
-    const result = await askMadarGroupAssistant({
-      groupTitle: group.title,
-      humorLevel: group.ai_humor_level,
-      maxChars: group.ai_max_reply_chars,
-      allowedTopics: group.ai_allowed_topics,
-      userMessage: parsed.data.message.trim(),
-      senderName: auth?.display_name || 'کاربر مدار',
-    });
-
-    db.transaction(() => {
-      db.prepare('UPDATE telegram_groups SET ai_used_today = ai_used_today + 1 WHERE id = ?').run(group.id);
-      db.prepare(
-        "INSERT INTO ai_usage_logs (user_id, group_id, model, prompt_chars, response_chars, status) VALUES (?, ?, ?, ?, ?, 'ok')"
-      ).run(auth?.id ?? null, group.id, result.model, parsed.data.message.length, result.text.length);
-    })();
-
-    return NextResponse.json({
-      ok: true,
-      reply: result.text,
-      model: result.model,
-      remainingQuota: Math.max(0, group.ai_daily_limit - (group.ai_used_today + 1)),
-    });
-  } catch (err) {
-    const rawMsg = err instanceof Error ? err.message : 'UNKNOWN';
-    db.prepare(
-      "INSERT INTO ai_usage_logs (user_id, group_id, model, prompt_chars, response_chars, status) VALUES (?, ?, 'gemini-4-hydrogen', ?, 0, ?)"
-    ).run(auth?.id ?? null, group.id, parsed.data.message.length, rawMsg.slice(0, 80));
-
-    if (rawMsg === 'GEMINI_API_KEY_NOT_CONFIGURED') {
-      return NextResponse.json(
-        {
-          error:
-            'کلید Gemini API در تنظیمات سرور (Settings > Secrets) تنظیم نشده است. سایر امکانات مدار بدون اختلال فعال هستند.',
-        },
-        { status: 503 }
-      );
-    }
-
-    return NextResponse.json(
-      {
-        error:
-          'ارتباط با سرویس Gemini موقتاً با خطا مواجه شد. سایر قابلیت‌های ربات و بازی‌ها بدون مشکل در دسترس هستند.',
-      },
-      { status: 502 }
+  // Only authorized group admin/owner or platform admin may invoke the group assistant console
+  const isAdmin =
+    auth.role === 'admin' ||
+    (group.owner_user_id && Number(group.owner_user_id) === auth.id) ||
+    Boolean(
+      db
+        .prepare("SELECT 1 FROM telegram_group_admins WHERE group_id = ? AND user_id = ? AND telegram_status IN ('creator', 'administrator')")
+        .get(group.id, auth.id)
     );
+  if (!isAdmin) {
+    return NextResponse.json({ error: 'شما مجوز مدیریت این گروه را ندارید.' }, { status: 403 });
   }
+
+  if (!group.ai_enabled) {
+    return NextResponse.json({ error: 'پاسخ‌گوی خودکار محلی در این گروه غیرفعال است.' }, { status: 403 });
+  }
+
+  const activeProtections: string[] = [];
+  if (group.anti_link) activeProtections.push('ضدلینک');
+  if (group.anti_ads) activeProtections.push('ضدتبلیغ');
+  if (group.anti_spam) activeProtections.push('ضداسپم');
+  if (group.anti_flood) activeProtections.push('ضدFlood');
+  if (group.anti_tabchi) activeProtections.push('ضدتبچی');
+  if (group.lock_media) activeProtections.push('قفل رسانه');
+
+  const result = generateLocalGroupReply({
+    groupTitle: group.title,
+    rulesText: group.rules_text || '',
+    welcomeText: group.welcome_text || '',
+    userMessage: parsed.data.message.trim(),
+    senderName: auth.display_name,
+    activeProtections,
+  });
+
+  db.prepare(
+    "INSERT INTO ai_usage_logs (user_id, group_id, model, prompt_chars, response_chars, status) VALUES (?, ?, ?, ?, ?, 'ok')"
+  ).run(auth.id, group.id, result.engine, parsed.data.message.length, result.text.length);
+
+  return NextResponse.json({
+    ok: true,
+    reply: result.text,
+    model: 'موتور محلی مدار',
+  });
 }

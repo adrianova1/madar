@@ -2,13 +2,14 @@ import Database from 'better-sqlite3';
 import path from 'path';
 import fs from 'fs';
 import crypto from 'crypto';
+import { RICH_TRUTH_DARE_PROMPTS } from './truth-dare-prompts';
 
-const DATA_DIR = path.join(process.cwd(), 'data');
+const CUSTOM_DB_PATH = process.env.DATABASE_PATH?.trim();
+const DB_PATH = CUSTOM_DB_PATH ? path.resolve(CUSTOM_DB_PATH) : path.join(process.cwd(), 'data', 'madar.db');
+const DATA_DIR = path.dirname(DB_PATH);
 if (!fs.existsSync(DATA_DIR)) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
 }
-
-const DB_PATH = path.join(DATA_DIR, 'madar.db');
 
 declare global {
   var __madarDb: Database.Database | undefined;
@@ -482,6 +483,16 @@ function initSchema(db: Database.Database) {
       FOREIGN KEY (sender_id) REFERENCES users(id) ON DELETE CASCADE
     );
 
+    CREATE TABLE IF NOT EXISTS telegram_group_admins (
+      group_id INTEGER NOT NULL,
+      user_id INTEGER NOT NULL,
+      telegram_status TEXT NOT NULL DEFAULT 'administrator',
+      verified_at TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (group_id, user_id),
+      FOREIGN KEY (group_id) REFERENCES telegram_groups(id) ON DELETE CASCADE,
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+
     CREATE INDEX IF NOT EXISTS idx_sessions_token ON user_sessions(token_hash);
     CREATE INDEX IF NOT EXISTS idx_likes_to ON likes(to_user_id);
     CREATE INDEX IF NOT EXISTS idx_whispers_recipient ON whispers(recipient_user_id);
@@ -493,23 +504,33 @@ function initSchema(db: Database.Database) {
     CREATE INDEX IF NOT EXISTS idx_blind_dates_users ON blind_dates(user_a_id, user_b_id);
   `);
 
-  // Ensure rich Truth or Dare prompts exist across all 6 modes for existing DBs
-  const tdCountNow = (db.prepare('SELECT COUNT(*) as c FROM truth_dare_prompts').get() as { c: number }).c;
-  if (tdCountNow > 0 && tdCountNow < 18) {
-    const extraPrompts = [
-      { mode: 'truth', category: 'دوستانه', text: 'اگر امروز می‌توانستی به یک شهر دیگر در دنیا سفر کنی، کجا می‌رفتی و با چه کسی؟', adult: 0 },
-      { mode: 'dare', category: 'احساسی', text: 'صادقانه‌ترین قدردانی خودت را نسبت به کسی که در زندگی‌ات تاثیر مثبتی داشته بیان کن.', adult: 0 },
-      { mode: 'truth', category: 'خنده‌دار', text: 'بدترین غذای دست‌پخت خودت که مجبور شدی بخوری چه بوده؟', adult: 0 },
-      { mode: 'dare', category: 'دوستانه', text: 'به مدت ۳۰ ثانیه بدون لبخند زدن به نگاه جمع پاسخ بده!', adult: 0 },
-      { mode: 'truth', category: 'عاشقانه', text: 'کوچک‌ترین حرکت یا توجهی که سریع دل تو را می‌برد چیست؟', adult: 0 },
-      { mode: 'dare', category: 'چالشی', text: 'سه حقیقت و یک دروغ درباره خودت بگو تا جمع دروغ را حدس بزند.', adult: 0 },
-    ];
-    const insExtra = db.prepare('INSERT INTO truth_dare_prompts (mode, category, text, is_adult) VALUES (?, ?, ?, ?)');
-    for (const p of extraPrompts) {
-      const exists = db.prepare('SELECT 1 FROM truth_dare_prompts WHERE text = ?').get(p.text);
-      if (!exists) insExtra.run(p.mode, p.category, p.text, p.adult);
-    }
+  // Safe additive column migrations for telegram_groups (preserves all existing group configs)
+  const groupCols = db.prepare('PRAGMA table_info(telegram_groups)').all() as { name: string }[];
+  const hasCol = (col: string) => groupCols.some((c) => c.name === col);
+  if (!hasCol('owner_user_id')) {
+    db.exec('ALTER TABLE telegram_groups ADD COLUMN owner_user_id INTEGER');
   }
+  if (!hasCol('sensitivity_level')) {
+    db.exec("ALTER TABLE telegram_groups ADD COLUMN sensitivity_level TEXT NOT NULL DEFAULT 'medium'");
+  }
+  if (!hasCol('anti_tabchi')) {
+    db.exec('ALTER TABLE telegram_groups ADD COLUMN anti_tabchi INTEGER NOT NULL DEFAULT 1');
+  }
+  if (!hasCol('mute_duration_minutes')) {
+    db.exec('ALTER TABLE telegram_groups ADD COLUMN mute_duration_minutes INTEGER NOT NULL DEFAULT 10');
+  }
+
+  // Sync rich human Persian Truth or Dare prompt library (116+ distinct items across 6 categories)
+  const syncPromptsTx = db.transaction(() => {
+    const checkExists = db.prepare('SELECT id FROM truth_dare_prompts WHERE mode = ? AND text = ?');
+    const insPrompt = db.prepare('INSERT INTO truth_dare_prompts (mode, category, text, is_adult) VALUES (?, ?, ?, ?)');
+    for (const p of RICH_TRUTH_DARE_PROMPTS) {
+      if (!checkExists.get(p.mode, p.text)) {
+        insPrompt.run(p.mode, p.category, p.text, p.isAdult);
+      }
+    }
+  });
+  syncPromptsTx();
 
   // Safe migration for existing seeded community users: ensure dating_profiles & constellation referrals exist
   const dpCount = (db.prepare('SELECT COUNT(*) as c FROM dating_profiles').get() as { c: number }).c;
@@ -563,7 +584,7 @@ function seedInitialData(db: Database.Database) {
       { id: 'jupiter', name: 'مشتری', subtitle: 'مافیا و حکم گروهی', target: 'games:hokm', color: '#eab308', image: '/images/madar/jupiter.jpg' },
       { id: 'neptune', name: 'نپتون', subtitle: 'نجوا و پیام ناشناس', target: 'whisper', color: '#22d3ee', image: '/images/madar/neptune.jpg' },
       { id: 'mercury', name: 'عطارد', subtitle: 'کوییز و لیگ دانش', target: 'games:quiz', color: '#a78bfa', image: '' },
-      { id: 'saturn', name: 'زحل', subtitle: 'مدیریت گروه و هوش مصنوعی', target: 'saturn', color: '#f59e0b', image: '' },
+      { id: 'saturn', name: 'زحل', subtitle: 'مدیریت محلی و ضداسپم گروه', target: 'saturn', color: '#f59e0b', image: '' },
     ];
 
     db.prepare('INSERT OR REPLACE INTO system_settings (key, value_json) VALUES (?, ?)').run(
@@ -901,7 +922,7 @@ function seedInitialData(db: Database.Database) {
       insertTd.run(p.mode, p.category, p.text, p.adult);
     }
 
-    // 7. Seed Telegram Group for Saturn Moderation & Gemini Assistant
+    // 7. Seed Telegram Group for Saturn Local Moderation Engine
     const grpRes = db.prepare(`
       INSERT INTO telegram_groups (chat_id, title, member_count, bot_is_admin, anti_link, anti_ads, anti_spam, anti_flood, lock_media)
       VALUES ('-10024891023', 'کهکشان دوستان مدار', 186, 1, 1, 1, 1, 1, 0)

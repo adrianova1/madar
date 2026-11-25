@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { z } from 'zod';
 import { adjustStarsAtomic, getDb } from '@/lib/db';
-import { calculateAge, getAuthUser } from '@/lib/security';
+import { calculateAge, checkRateLimit, getAuthUser } from '@/lib/security';
 
 const RecordGameSchema = z.object({
   gameType: z.enum(['quiz', 'truth_dare', 'mafia', 'hokm']),
@@ -47,15 +47,14 @@ export async function GET(req: NextRequest) {
 
   const category = req.nextUrl.searchParams.get('category')?.trim() || '';
   const quizRows = category && category !== 'همه'
-    ? db.prepare('SELECT id, category, question, options_json, correct_index, difficulty FROM quiz_questions WHERE category = ? ORDER BY RANDOM() LIMIT 10').all(category)
-    : db.prepare('SELECT id, category, question, options_json, correct_index, difficulty FROM quiz_questions ORDER BY RANDOM() LIMIT 10').all();
+    ? db.prepare('SELECT id, category, question, options_json, difficulty FROM quiz_questions WHERE category = ? ORDER BY RANDOM() LIMIT 10').all(category)
+    : db.prepare('SELECT id, category, question, options_json, difficulty FROM quiz_questions ORDER BY RANDOM() LIMIT 10').all();
 
-  const quizQuestions = (quizRows as { id: number; category: string; question: string; options_json: string; correct_index: number; difficulty: string }[]).map((q) => ({
+  const quizQuestions = (quizRows as { id: number; category: string; question: string; options_json: string; difficulty: string }[]).map((q) => ({
     id: q.id,
     category: q.category,
     question: q.question,
     options: JSON.parse(q.options_json) as string[],
-    correctIndex: q.correct_index,
     difficulty: q.difficulty,
   }));
 
@@ -98,6 +97,11 @@ export async function GET(req: NextRequest) {
 export async function POST(req: NextRequest) {
   const auth = getAuthUser(req);
   if (!auth) return NextResponse.json({ error: 'برای ثبت رکورد و دریافت ستاره وارد حساب شوید.' }, { status: 401 });
+
+  const rl = checkRateLimit(`games_record:${auth.id}`, 6, 60_000);
+  if (!rl.allowed) {
+    return NextResponse.json({ error: 'تعداد ثبت نتایج بازی بیش از حد مجاز است. کمی صبر کنید.' }, { status: 429 });
+  }
 
   const body = await req.json().catch(() => null);
   const parsed = RecordGameSchema.safeParse(body);

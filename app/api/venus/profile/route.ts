@@ -58,9 +58,9 @@ export async function POST(req: NextRequest) {
     | { birth_date: string | null }
     | undefined;
   const age = calculateAge(profile?.birth_date);
-  if (age !== null && age < 18) {
+  if (age === null || age < 18) {
     return NextResponse.json(
-      { error: 'ساخت پروفایل آشنایی ونوس برای کاربران زیر ۱۸ سال مجاز نیست.' },
+      { error: 'ساخت پروفایل آشنایی ونوس نیازمند تاریخ تولد معتبر و سن حداقل ۱۸ سال است.' },
       { status: 403 }
     );
   }

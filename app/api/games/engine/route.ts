@@ -3,8 +3,10 @@ import { z } from 'zod';
 import { getDb } from '@/lib/db';
 import { getAuthUser } from '@/lib/security';
 import {
+  assertRoomMember,
   cleanupExpiredEngineRooms,
   createEngineRoom,
+  GameEngineError,
   handleHokmChooseTrump,
   handleHokmNextHand,
   handleHokmPlayCard,
@@ -109,6 +111,10 @@ const EngineActionSchema = z.discriminatedUnion('action', [
 export async function GET(req: NextRequest) {
   cleanupExpiredEngineRooms();
   const auth = getAuthUser(req);
+  if (!auth) {
+    return NextResponse.json({ error: 'برای مشاهده وضعیت اتاق بازی ابتدا وارد حساب تلگرام خود شوید.' }, { status: 401 });
+  }
+
   const roomCode = req.nextUrl.searchParams.get('roomCode')?.trim().toUpperCase();
 
   if (roomCode) {
@@ -116,15 +122,24 @@ export async function GET(req: NextRequest) {
     if (!state) {
       return NextResponse.json({ error: 'اتاق بازی یافت نشد یا منقضی شده است.' }, { status: 404 });
     }
+    const isMember = state.players.some((p) => p.userId === auth.id && p.status !== 'left');
+    if (!isMember) {
+      return NextResponse.json(
+        { error: 'شما عضو این اتاق بازی نیستید. ابتدا با کد اتاق به آن بپیوندید.' },
+        { status: 403 }
+      );
+    }
     return NextResponse.json({
-      room: sanitizeEngineStateForUser(state, auth?.id ?? null),
+      room: sanitizeEngineStateForUser(state, auth.id),
     });
   }
 
   const db = getDb();
   const activeRows = db
-    .prepare("SELECT room_code, game_type, is_hangout, status, updated_at FROM engine_rooms WHERE status != 'finished' ORDER BY id DESC LIMIT 10")
-    .all();
+    .prepare(
+      "SELECT room_code, game_type, is_hangout, status, updated_at FROM engine_rooms WHERE host_user_id = ? AND status != 'finished' ORDER BY id DESC LIMIT 10"
+    )
+    .all(auth.id);
 
   return NextResponse.json({
     activeRooms: activeRows,
@@ -159,7 +174,7 @@ export async function POST(req: NextRequest) {
         hostUserId: auth.id,
         hostDisplayName: auth.display_name,
         hostInitials: prof?.avatar_initials || auth.display_name.slice(0, 2),
-        hostColor: prof?.avatar_color || '#3b82f6',
+        hostColor: prof?.avatar_color || '#38bdf8',
         gameType: d.gameType,
         isHangout: d.isHangout,
         playerNames: d.playerNames,
@@ -181,7 +196,10 @@ export async function POST(req: NextRequest) {
 
     if (d.action === 'join_room') {
       const already = state.players.find((p) => p.userId === auth.id);
-      if (!already) {
+      if (already) {
+        already.status = 'playing';
+        saveEngineRoom(state, 'playing');
+      } else {
         const prof = db
           .prepare('SELECT avatar_initials, avatar_color FROM user_profiles WHERE user_id = ?')
           .get(auth.id) as { avatar_initials: string; avatar_color: string } | undefined;
@@ -191,32 +209,38 @@ export async function POST(req: NextRequest) {
           botSlot.userId = auth.id;
           botSlot.name = auth.display_name;
           botSlot.avatarInitials = prof?.avatar_initials || auth.display_name.slice(0, 2);
-          botSlot.avatarColor = prof?.avatar_color || '#7c3aed';
+          botSlot.avatarColor = prof?.avatar_color || '#8b5cf6';
           botSlot.isBot = false;
+          botSlot.status = 'playing';
         } else if (state.players.length < 10) {
           state.players.push({
             id: `u_${auth.id}`,
             userId: auth.id,
             name: auth.display_name,
             avatarInitials: prof?.avatar_initials || auth.display_name.slice(0, 2),
-            avatarColor: prof?.avatar_color || '#7c3aed',
+            avatarColor: prof?.avatar_color || '#8b5cf6',
             isBot: false,
             score: 0,
             status: 'playing',
           });
+        } else {
+          return NextResponse.json({ error: 'ظرفیت این اتاق تکمیل شده است.' }, { status: 400 });
         }
         saveEngineRoom(state, 'playing');
       }
       return NextResponse.json({ ok: true, room: sanitizeEngineStateForUser(state, auth.id) });
     }
 
+    // Strict membership check for ALL room actions beyond create_room / join_room
+    assertRoomMember(state, auth.id);
+
     if (d.action === 'switch_game') {
-      const next = handleSwitchHangoutGame(state, d.nextGame, d.category);
+      const next = handleSwitchHangoutGame(state, auth.id, d.nextGame, d.category);
       return NextResponse.json({ ok: true, room: sanitizeEngineStateForUser(next, auth.id) });
     }
 
     if (d.action === 'hokm_choose_trump') {
-      const next = handleHokmChooseTrump(state, d.suit);
+      const next = handleHokmChooseTrump(state, auth.id, d.suit);
       return NextResponse.json({ ok: true, room: sanitizeEngineStateForUser(next, auth.id) });
     }
 
@@ -226,12 +250,12 @@ export async function POST(req: NextRequest) {
         ok: true,
         room: sanitizeEngineStateForUser(next, auth.id),
         starsAwarded,
-        message: starsAwarded ? `مسابقه به پایان رسید و +${starsAwarded} ستاره دریافت کردی!` : undefined,
+        message: starsAwarded ? `مسابقه پایان یافت و +${starsAwarded} ستاره دریافت کردی!` : undefined,
       });
     }
 
     if (d.action === 'hokm_next_hand') {
-      const next = handleHokmNextHand(state);
+      const next = handleHokmNextHand(state, auth.id);
       return NextResponse.json({ ok: true, room: sanitizeEngineStateForUser(next, auth.id) });
     }
 
@@ -246,7 +270,7 @@ export async function POST(req: NextRequest) {
     }
 
     if (d.action === 'mafia_start_vote') {
-      const next = handleMafiaStartVote(state);
+      const next = handleMafiaStartVote(state, auth.id);
       return NextResponse.json({ ok: true, room: sanitizeEngineStateForUser(next, auth.id) });
     }
 
@@ -261,7 +285,7 @@ export async function POST(req: NextRequest) {
     }
 
     if (d.action === 'td_spin') {
-      const next = handleTruthDareSpin(state, d.category);
+      const next = handleTruthDareSpin(state, auth.id, d.category);
       return NextResponse.json({ ok: true, room: sanitizeEngineStateForUser(next, auth.id) });
     }
 
@@ -276,7 +300,7 @@ export async function POST(req: NextRequest) {
         ok: true,
         room: sanitizeEngineStateForUser(next, auth.id),
         starsAwarded,
-        message: starsAwarded ? `+${starsAwarded} ستاره پاداش جرئت و حقیقت واریز شد!` : undefined,
+        message: starsAwarded ? `+${starsAwarded} ستاره پاداش دریافت کردی!` : undefined,
       });
     }
 
@@ -302,18 +326,22 @@ export async function POST(req: NextRequest) {
         ok: true,
         room: sanitizeEngineStateForUser(next, auth.id),
         starsAwarded,
-        message: starsAwarded ? `مسابقه کوییز پایان یافت و +${starsAwarded} ستاره دریافت کردی!` : undefined,
+        message: starsAwarded ? `کوییز پایان یافت و +${starsAwarded} ستاره دریافت کردی!` : undefined,
       });
     }
 
     if (d.action === 'leave_room') {
       state.players = state.players.map((p) => (p.userId === auth.id ? { ...p, status: 'left' } : p));
-      saveEngineRoom(state, 'finished');
+      const anyHumansLeft = state.players.some((p) => !p.isBot && p.status !== 'left');
+      saveEngineRoom(state, anyHumansLeft ? 'playing' : 'finished');
       return NextResponse.json({ ok: true, message: 'از اتاق بازی خارج شدید.' });
     }
 
     return NextResponse.json({ error: 'عملیات ناشناخته است.' }, { status: 400 });
   } catch (err) {
+    if (err instanceof GameEngineError) {
+      return NextResponse.json({ error: err.message }, { status: err.statusCode });
+    }
     return NextResponse.json(
       { error: err instanceof Error ? err.message : 'خطا در پردازش موتور بازی' },
       { status: 400 }

@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { z } from 'zod';
 import crypto from 'crypto';
 import { getDb } from '@/lib/db';
-import { checkRateLimit, getAuthUser, hashToken, normalizeIranPhone } from '@/lib/security';
+import { checkRateLimit, getAuthUser, getClientIp, hashToken, normalizeIranPhone } from '@/lib/security';
 
 const OtpSchema = z.discriminatedUnion('step', [
   z.object({
@@ -16,10 +16,53 @@ const OtpSchema = z.discriminatedUnion('step', [
   }),
 ]);
 
+async function dispatchRealSms(phone: string, code: string): Promise<{ delivered: boolean; error?: string }> {
+  const apiKey = process.env.SMS_PROVIDER_API_KEY?.trim();
+  const providerUrl = process.env.SMS_PROVIDER_URL?.trim();
+  if (!apiKey || !providerUrl) {
+    return { delivered: false, error: 'SMS_NOT_CONFIGURED' };
+  }
+
+  let parsedUrl: URL;
+  try {
+    parsedUrl = new URL(providerUrl);
+    if (parsedUrl.protocol !== 'https:') {
+      return { delivered: false, error: 'SMS_URL_MUST_BE_HTTPS' };
+    }
+  } catch {
+    return { delivered: false, error: 'SMS_URL_INVALID' };
+  }
+
+  try {
+    const res = await fetch(parsedUrl.toString(), {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${apiKey}`,
+        'x-api-key': apiKey,
+      },
+      body: JSON.stringify({
+        receptor: phone,
+        message: `کد تأیید مدار: ${code}`,
+        code,
+      }),
+      signal: AbortSignal.timeout(8000),
+    });
+
+    if (!res.ok) {
+      return { delivered: false, error: `SMS_GATEWAY_HTTP_${res.status}` };
+    }
+    return { delivered: true };
+  } catch {
+    return { delivered: false, error: 'SMS_GATEWAY_UNREACHABLE' };
+  }
+}
+
 export async function POST(req: NextRequest) {
   const auth = getAuthUser(req);
   if (!auth) return NextResponse.json({ error: 'احراز هویت الزامی است.' }, { status: 401 });
 
+  const ip = getClientIp(req);
   const body = await req.json().catch(() => null);
   const parsed = OtpSchema.safeParse(body);
   if (!parsed.success) {
@@ -28,16 +71,25 @@ export async function POST(req: NextRequest) {
 
   const normalized = normalizeIranPhone(parsed.data.phone);
   if (!normalized) {
-    return NextResponse.json({ error: 'شماره موبایل معتبر ایران با پیش‌شماره +98 یا 09 وارد کنید.' }, { status: 400 });
+    return NextResponse.json({ error: 'شماره موبایل معتبر ایران با +98 یا 09 وارد کنید.' }, { status: 400 });
   }
 
   const db = getDb();
+  const isProd = process.env.NODE_ENV === 'production';
 
   if (parsed.data.step === 'request') {
+    const ipRl = checkRateLimit(`otp_ip:${ip}`, 10, 15 * 60 * 1000);
+    if (!ipRl.allowed) {
+      return NextResponse.json(
+        { error: `تعداد درخواست‌ها زیاد است. ${ipRl.retryAfterSec} ثانیه صبر کنید.` },
+        { status: 429 }
+      );
+    }
+
     const rl = checkRateLimit(`otp_req:${auth.id}:${normalized}`, 3, 10 * 60 * 1000);
     if (!rl.allowed) {
       return NextResponse.json(
-        { error: `سقف ارسال کد تأیید پر شده است. لطفاً ${rl.retryAfterSec} ثانیه دیگر تلاش کنید.` },
+        { error: `سقف ارسال کد پر شده است. ${rl.retryAfterSec} ثانیه دیگر تلاش کنید.` },
         { status: 429 }
       );
     }
@@ -46,25 +98,50 @@ export async function POST(req: NextRequest) {
     const codeHash = hashToken(`${normalized}:${code}`);
     const expiresAt = new Date(Date.now() + 5 * 60 * 1000).toISOString();
 
+    const smsResult = await dispatchRealSms(normalized, code);
+
+    if (!smsResult.delivered) {
+      if (isProd) {
+        return NextResponse.json(
+          {
+            ok: false,
+            smsProviderActive: false,
+            error: 'سرویس ارسال پیامک روی سرور متصل نیست. امکان ارسال کد تأیید وجود ندارد.',
+          },
+          { status: 503 }
+        );
+      }
+
+      // Non-production dev/test mode only: store OTP and explicitly indicate no real SMS was sent
+      db.prepare(
+        'INSERT INTO phone_verifications (user_id, phone, code_hash, expires_at) VALUES (?, ?, ?, ?)'
+      ).run(auth.id, normalized, codeHash, expiresAt);
+
+      return NextResponse.json({
+        ok: true,
+        phone: normalized,
+        smsProviderActive: false,
+        smsDelivered: false,
+        sandboxOtpPreview: code,
+        message: 'محیط توسعه: درگاه پیامکی متصل نیست و پیامکی ارسال نشده است. کد آزمایشی صرفاً برای تست نمایش داده شد.',
+      });
+    }
+
     db.prepare(
       'INSERT INTO phone_verifications (user_id, phone, code_hash, expires_at) VALUES (?, ?, ?, ?)'
     ).run(auth.id, normalized, codeHash, expiresAt);
 
-    const hasSmsProvider = Boolean(process.env.SMS_PROVIDER_API_KEY);
     return NextResponse.json({
       ok: true,
       phone: normalized,
-      smsProviderActive: hasSmsProvider,
-      // Only return sandbox code when no external Iranian SMS gateway is configured yet
-      sandboxOtpPreview: hasSmsProvider ? undefined : code,
-      message: hasSmsProvider
-        ? 'کد ۶ رقمی به شماره شما پیامک شد.'
-        : 'درگاه پیامکی خارجی (SMS_PROVIDER_API_KEY) متصل نیست؛ کد آزمایشی برای تست جریان تأیید صادر شد.',
+      smsProviderActive: true,
+      smsDelivered: true,
+      message: 'کد تأیید ۶ رقمی به شماره شما ارسال شد.',
     });
   }
 
   // Verify step
-  const rlVerify = checkRateLimit(`otp_ver:${auth.id}`, 8, 10 * 60 * 1000);
+  const rlVerify = checkRateLimit(`otp_ver:${auth.id}:${ip}`, 8, 10 * 60 * 1000);
   if (!rlVerify.allowed) {
     return NextResponse.json({ error: 'تعداد تلاش‌های بررسی کد بیش از حد مجاز است.' }, { status: 429 });
   }
@@ -79,14 +156,17 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: 'درخواست کد فعالی برای این شماره یافت نشد.' }, { status: 400 });
   }
   if (record.attempts >= 5) {
-    return NextResponse.json({ error: 'کد به دلیل تلاش ناموفق متعدد منقضی شد. کد جدید درخواست دهید.' }, { status: 429 });
+    return NextResponse.json({ error: 'کد به دلیل تلاش ناموفق منقضی شد. کد جدید بگیرید.' }, { status: 429 });
   }
   if (new Date(record.expires_at).getTime() < Date.now()) {
-    return NextResponse.json({ error: 'مهلت کد تأیید به پایان رسیده است.' }, { status: 400 });
+    return NextResponse.json({ error: 'مهلت کد تأیید تمام شده است.' }, { status: 400 });
   }
 
   const expectedHash = hashToken(`${normalized}:${parsed.data.code}`);
-  if (expectedHash !== record.code_hash) {
+  const aBuf = Buffer.from(expectedHash, 'hex');
+  const bBuf = Buffer.from(record.code_hash, 'hex');
+  const matched = aBuf.length === bBuf.length && crypto.timingSafeEqual(aBuf, bBuf);
+  if (!matched) {
     db.prepare('UPDATE phone_verifications SET attempts = attempts + 1 WHERE id = ?').run(record.id);
     return NextResponse.json({ error: 'کد واردشده نادرست است.' }, { status: 400 });
   }
@@ -99,6 +179,6 @@ export async function POST(req: NextRequest) {
   return NextResponse.json({
     ok: true,
     phoneMasked: `${normalized.slice(0, 6)}****${normalized.slice(-2)}`,
-    message: 'شماره موبایل شما با موفقیت تأیید شد و به کاربران دیگر نمایش داده نمی‌شود.',
+    message: 'شماره موبایل با موفقیت تأیید شد.',
   });
 }

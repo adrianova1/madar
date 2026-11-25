@@ -171,7 +171,7 @@ export async function GET(req: NextRequest) {
     | { birth_date: string | null }
     | undefined;
   const myAge = calculateAge(me?.birth_date);
-  if (myAge !== null && myAge < 18) {
+  if (myAge === null || myAge < 18) {
     return NextResponse.json({ ageRestricted: true, sessions: [], icebreakers: ICEBREAKERS, qaBank: BLIND_QA_QUESTIONS });
   }
 
@@ -213,8 +213,8 @@ export async function POST(req: NextRequest) {
     .get(auth.id) as { birth_date: string | null; city: string; interests: string; goal: string } | undefined;
 
   const myAge = calculateAge(me?.birth_date);
-  if (myAge !== null && myAge < 18) {
-    return NextResponse.json({ error: 'بخش آشنایی ناشناس فقط برای کاربران بالای ۱۸ سال در دسترس است.' }, { status: 403 });
+  if (myAge === null || myAge < 18) {
+    return NextResponse.json({ error: 'بخش آشنایی ناشناس فقط با تاریخ تولد معتبر بالای ۱۸ سال در دسترس است.' }, { status: 403 });
   }
 
   const d = parsed.data;
@@ -250,7 +250,7 @@ export async function POST(req: NextRequest) {
 
     const adultCands = candidates.filter((c) => {
       const age = calculateAge(c.birth_date);
-      return age === null || age >= 18;
+      return age !== null && age >= 18;
     });
 
     if (adultCands.length === 0) {

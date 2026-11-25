@@ -611,88 +611,78 @@ export default function VenusDating({ token, user, liteMode = false, onRequireAu
                     </>
                   )}
 
-                  {/* Portrait Hero Header */}
+                  {/* Photo-First Visual Portrait Hero */}
                   <div
-                    className="relative p-5 sm:p-7 flex flex-col sm:flex-row sm:items-end justify-between gap-5 border-b border-indigo-500/20"
+                    className="relative min-h-[250px] sm:min-h-[280px] p-5 sm:p-6 flex flex-col justify-between border-b border-[#23303e]"
                     style={{
-                      background: `linear-gradient(135deg, ${currentCandidate.avatarColor} 0%, #0a1026 85%)`,
+                      background: `radial-gradient(circle at 75% 22%, ${currentCandidate.avatarColor} 0%, #17212b 62%, #0e1621 100%)`,
                     }}
                   >
-                    <div className="flex items-center gap-4 min-w-0">
-                      <div className="w-18 h-18 sm:w-20 sm:h-20 rounded-2xl bg-slate-950/65 border border-white/20 flex items-center justify-center text-2xl font-bold text-white shrink-0 shadow-lg">
+                    <div className="flex items-start justify-between gap-2">
+                      <span className="inline-flex items-center gap-1 rounded-xl bg-[#0e1621]/85 border border-[#23303e] px-3 py-1.5 text-xs font-mono font-bold text-amber-300">
+                        سازگاری تخمینی {currentCandidate.compatibilityScore}%
+                      </span>
+                      <span className="inline-flex items-center gap-1 rounded-xl bg-[#0e1621]/85 border border-[#23303e] px-2.5 py-1 text-[11px] text-slate-200">
+                        <MapPin className="w-3 h-3 text-[#38bdf8]" />
+                        {currentCandidate.city}
+                      </span>
+                    </div>
+
+                    <div className="flex flex-col items-center my-3">
+                      <div
+                        className="w-24 h-24 sm:w-28 sm:h-28 rounded-3xl border-2 border-white/25 flex items-center justify-center text-3xl font-bold text-white shadow-2xl"
+                        style={{ backgroundColor: currentCandidate.avatarColor }}
+                      >
                         {currentCandidate.avatarInitials}
                       </div>
-                      <div className="space-y-1 min-w-0">
+                    </div>
+
+                    <div className="flex items-end justify-between gap-3">
+                      <div className="min-w-0">
                         <div className="flex items-center gap-1.5">
                           <h2 className="text-xl sm:text-2xl font-bold text-white truncate">
                             {currentCandidate.displayName}،{' '}
                             <span className="font-mono tabular-nums">{currentCandidate.age}</span>
                           </h2>
                           {currentCandidate.phoneVerified && (
-                            <CheckCircle2 className="w-4 h-4 text-cyan-300 shrink-0" />
+                            <CheckCircle2 className="w-4 h-4 text-[#38bdf8] shrink-0" />
                           )}
                         </div>
-                        <div className="flex flex-wrap items-center gap-2 text-xs text-slate-200/85">
-                          <span className="inline-flex items-center gap-1">
-                            <MapPin className="w-3.5 h-3.5" />
-                            {currentCandidate.city}
-                          </span>
-                          <span>·</span>
-                          <span>{currentCandidate.goal}</span>
-                        </div>
+                        <p className="text-xs text-slate-300 mt-0.5 truncate">{currentCandidate.goal}</p>
                       </div>
-                    </div>
-
-                    {/* Explicitly Labeled Estimated Compatibility */}
-                    <div className="text-right sm:text-left shrink-0">
-                      <p className="text-[11px] text-slate-300">سازگاری تخمینی (نه قطعی)</p>
-                      <p className="text-3xl font-bold font-mono tabular-nums text-amber-300">
-                        {currentCandidate.compatibilityScore}%
-                      </p>
                     </div>
                   </div>
 
-                  {/* Card Body */}
-                  <div className="p-5 sm:p-7 space-y-5">
-                    <p className="text-sm sm:text-base text-slate-200 leading-relaxed">
-                      {currentCandidate.bio || 'کاربر هنوز بیوگرافی ننوشته است.'}
-                    </p>
+                  {/* Concise Visual-First Body */}
+                  <div className="p-4 sm:p-5 space-y-4">
+                    {currentCandidate.bio && (
+                      <p className="text-sm text-slate-200 leading-relaxed line-clamp-3">
+                        {currentCandidate.bio}
+                      </p>
+                    )}
 
-                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 pt-3 border-t border-indigo-500/20">
-                      <div className="space-y-1.5">
-                        <h3 className="text-xs font-semibold text-cyan-300">چرا این پیشنهاد نمایش داده شد؟</h3>
-                        <ul className="space-y-1 text-xs sm:text-sm text-slate-300">
-                          {currentCandidate.matchReasons.slice(0, fullProfileOpen ? 6 : 3).map((r, i) => (
-                            <li key={i}>• {r}</li>
-                          ))}
-                        </ul>
-                      </div>
-
-                      <div className="space-y-1.5">
-                        <h3 className="text-xs font-semibold text-purple-300">علایق و ویژگی‌ها</h3>
-                        <p className="text-xs sm:text-sm text-slate-200 leading-relaxed">
-                          {currentCandidate.interests.join(' · ')}
-                        </p>
-                        {currentCandidate.traits.length > 0 && (
-                          <p className="text-xs text-cyan-300/90 pt-1">
-                            {currentCandidate.traits.join(' / ')}
-                          </p>
-                        )}
-                      </div>
+                    <div className="flex flex-wrap gap-1.5">
+                      {currentCandidate.interests.slice(0, 4).map((tag) => (
+                        <span
+                          key={tag}
+                          className="rounded-lg border border-[#23303e] bg-[#0e1621] px-2.5 py-1 text-xs text-slate-200"
+                        >
+                          {tag}
+                        </span>
+                      ))}
                     </div>
 
                     {fullProfileOpen && (
-                      <div className="rounded-2xl border border-indigo-500/25 bg-[#050816] p-4 text-xs text-slate-300 space-y-1.5">
-                        <p>
-                          نام کاربری مدار: <strong className="font-mono text-white">@{currentCandidate.username}</strong>
-                        </p>
-                        <p>
-                          اشتراک: <strong className="text-amber-300">{currentCandidate.subscriptionTier.toUpperCase()}</strong>
-                          {currentCandidate.tasteBoost ? ` · اثر یادگیری سلیقه: ${currentCandidate.tasteBoost > 0 ? '+' : ''}${currentCandidate.tasteBoost}%` : ''}
-                        </p>
-                        <p className="text-slate-400">
-                          شماره تماس و اطلاعات خصوصی هرگز نمایش داده نمی‌شوند.
-                        </p>
+                      <div className="rounded-2xl border border-[#23303e] bg-[#0e1621] p-3.5 text-xs text-slate-300 space-y-2">
+                        <p className="font-semibold text-[#38bdf8]">دلایل پیشنهاد:</p>
+                        <ul className="space-y-1">
+                          {currentCandidate.matchReasons.slice(0, 4).map((r, i) => (
+                            <li key={i}>• {r}</li>
+                          ))}
+                        </ul>
+                        {currentCandidate.traits.length > 0 && (
+                          <p className="text-slate-400 pt-1">{currentCandidate.traits.join(' · ')}</p>
+                        )}
                       </div>
                     )}
 

@@ -33,9 +33,6 @@ const AuthActionSchema = z.discriminatedUnion('mode', [
     initData: z.string().min(1),
     referralCode: z.string().max(32).optional(),
   }),
-  z.object({
-    mode: z.literal('demo_enter'),
-  }),
 ]);
 
 function buildUserBundle(userId: number) {
@@ -317,17 +314,6 @@ export async function POST(req: NextRequest) {
 
     const db = getDb();
     const data = parsed.data;
-
-    if (data.mode === 'demo_enter') {
-      const demo = db.prepare("SELECT id FROM users WHERE username = 'parham_sky' AND is_deleted = 0").get() as
-        | { id: number }
-        | undefined;
-      if (!demo) {
-        return NextResponse.json({ error: 'حساب پایه در دسترس نیست. لطفاً ثبت‌نام کنید.' }, { status: 404 });
-      }
-      const sess = createSession(demo.id, 'پیش‌نمایش وب مدار', ip);
-      return NextResponse.json({ token: sess.token, currentSessionId: sess.sessionId, ...buildUserBundle(demo.id) });
-    }
 
     if (data.mode === 'login') {
       const uname = data.username.trim().toLowerCase().replace(/^@/, '');

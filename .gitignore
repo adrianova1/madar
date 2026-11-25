@@ -5,3 +5,16 @@ coverage/
 *.log
 .env*
 !.env.example
+
+# SQLite databases, WAL/SHM journals, backups & local data
+data/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.sqlite-wal
+*.sqlite-shm
+.backup/
+*.bak
+*.tmp

@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import { motion } from 'motion/react';
 import {
   Eye,
@@ -60,7 +60,6 @@ export default function MafiaArena({
   onRewardNotice,
   onRefreshUser,
 }: MafiaArenaProps) {
-  // Primary mode: Auto-Moderated (confirmed), Secondary: Telegram Tri-Mode Sync (preserved)
   const [execMode, setExecMode] = useState<'auto' | 'trimode'>('auto');
   const [scenario, setScenario] = useState<'classic' | 'tactical'>('classic');
   const [namesInput, setNamesInput] = useState('نیلوفر، سارا، کیان، تارا، آرمان، سپهر');
@@ -70,26 +69,53 @@ export default function MafiaArena({
   const [err, setErr] = useState<string | null>(null);
   const [secondsLeft, setSecondsLeft] = useState(45);
 
-  // Preserved Tri-Mode Telegram Sync state
   const [syncRoom, setSyncRoom] = useState<SyncedGameRoom | null>(null);
   const [dmRole, setDmRole] = useState<PrivateDmRole | null>(null);
   const [activeVoterId, setActiveVoterId] = useState<string>('p_1');
 
   const mafia = room?.gameType === 'mafia' ? room.mafia : undefined;
 
+  const syncFromServer = useCallback(async () => {
+    if (!room || room.gameType !== 'mafia' || !token) return;
+    try {
+      const res = await fetch(`/api/games/engine?roomCode=${encodeURIComponent(room.roomCode)}`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (data.room) onRoomChange(data.room);
+      }
+    } catch {
+      // ignore transient poll error
+    }
+  }, [room, token, onRoomChange]);
+
+  // Live 3s polling sync so server-authoritative phase transitions reach all players
   useEffect(() => {
-    if (!mafia?.phaseEndsAt) return;
+    if (!room || room.gameType !== 'mafia' || !token || mafia?.phase === 'GAME_OVER') return;
+    const id = setInterval(() => void syncFromServer(), 3000);
+    return () => clearInterval(id);
+  }, [room, token, mafia?.phase, syncFromServer]);
+
+  useEffect(() => {
+    if (!mafia?.phaseEndsAt || mafia.phase === 'GAME_OVER') return;
+    let syncedZero = false;
     const tick = () => {
-      setSecondsLeft(Math.max(0, Math.ceil((mafia.phaseEndsAt - Date.now()) / 1000)));
+      const rem = Math.max(0, Math.ceil((mafia.phaseEndsAt - Date.now()) / 1000));
+      setSecondsLeft(rem);
+      if (rem === 0 && !syncedZero) {
+        syncedZero = true;
+        void syncFromServer();
+      }
     };
     tick();
     const id = setInterval(tick, 500);
     return () => clearInterval(id);
-  }, [mafia?.phaseEndsAt]);
+  }, [mafia?.phaseEndsAt, mafia?.phase, syncFromServer]);
 
   async function callEngine(payload: Record<string, unknown>) {
     if (!token) {
-      setErr('برای شروع مافیای خودکار ابتدا وارد حساب مدار شوید.');
+      setErr('ابتدا وارد حساب تلگرام خود شوید.');
       return;
     }
     setErr(null);
@@ -160,10 +186,10 @@ export default function MafiaArena({
     setSelectedTarget(null);
   }
 
-  // ==================== PRESERVED TRI-MODE TELEGRAM SYNC HANDLERS ====================
+  // ==================== FIXED TRI-MODE TELEGRAM SYNC HANDLERS ====================
   async function createTriModeRoom() {
     if (!token) {
-      setErr('برای ساخت اتاق سه‌حالته تلگرام ابتدا وارد حساب مدار شوید.');
+      setErr('ابتدا وارد حساب تلگرام شوید.');
       return;
     }
     const list = namesInput
@@ -180,7 +206,7 @@ export default function MafiaArena({
       const res = await fetch('/api/games/rooms', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-        body: JSON.stringify({ action: 'create', gameType: 'mafia', playerNames: list, groupTitle: 'کهکشان دوستان مدار' }),
+        body: JSON.stringify({ action: 'create', gameType: 'mafia', playerNames: list, groupTitle: 'گروه تلگرام مدار' }),
       });
       const data = await res.json();
       if (res.ok && data.room) {
@@ -201,7 +227,7 @@ export default function MafiaArena({
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
       body: JSON.stringify({
-        action: 'vote',
+        action: 'cast_vote',
         roomCode: syncRoom.roomCode,
         voterId: activeVoterId,
         targetId,
@@ -210,6 +236,7 @@ export default function MafiaArena({
     });
     const data = await res.json();
     if (res.ok && data.room) setSyncRoom(data.room);
+    else if (data.error) setErr(data.error);
   }
 
   async function fetchDmRole() {
@@ -217,12 +244,13 @@ export default function MafiaArena({
     const res = await fetch('/api/games/rooms', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-      body: JSON.stringify({ action: 'request_dm_role', roomCode: syncRoom.roomCode }),
+      body: JSON.stringify({ action: 'request_dm_role', roomCode: syncRoom.roomCode, playerId: activeVoterId }),
     });
     const data = await res.json();
-    if (res.ok && data.privateRole) {
-      setDmRole(data.privateRole);
-      if (data.room) setSyncRoom(data.room);
+    if (res.ok && data.privateDmPayload) {
+      setDmRole(data.privateDmPayload);
+    } else if (data.error) {
+      setErr(data.error);
     }
   }
 
@@ -235,6 +263,7 @@ export default function MafiaArena({
     });
     const data = await res.json();
     if (res.ok && data.room) setSyncRoom(data.room);
+    else if (data.error) setErr(data.error);
   }
 
   const isNight = mafia?.phase === 'NIGHT_ACTION';
@@ -246,72 +275,61 @@ export default function MafiaArena({
     mafia.aliveIds.includes(mafia.myPlayerId || '');
 
   return (
-    <div className="space-y-5 min-w-0">
-      {/* Mode Switcher: Auto-Moderated (Default) vs Telegram Tri-Mode Sync */}
-      <div className="madar-glass rounded-2xl p-3.5 sm:p-4 flex flex-wrap items-center justify-between gap-3">
-        <div className="space-y-0.5">
-          <p className="text-xs font-bold text-white">حالت اجرای مافیای مدار</p>
-          <p className="text-[11px] text-slate-400">
-            گرداننده خودکار بدون نیاز به راوی انسانی + همگام‌سازی کامل با گروه تلگرام
-          </p>
-        </div>
-
-        <div className="inline-flex items-center gap-1 p-1 bg-[#050816] border border-indigo-500/25 rounded-xl">
-          <button
-            type="button"
-            onClick={() => setExecMode('auto')}
-            className={`px-3.5 py-2 text-xs font-semibold rounded-lg min-h-[38px] transition-colors ${
-              execMode === 'auto' ? 'bg-amber-400 text-slate-950' : 'text-slate-300 hover:text-white'
-            }`}
-          >
-            گرداننده خودکار
-          </button>
-          <button
-            type="button"
-            onClick={() => setExecMode('trimode')}
-            className={`px-3.5 py-2 text-xs font-semibold rounded-lg min-h-[38px] transition-colors ${
-              execMode === 'trimode' ? 'bg-cyan-400 text-slate-950' : 'text-slate-300 hover:text-white'
-            }`}
-          >
-            همگام تلگرام (سه‌حالته)
-          </button>
-        </div>
+    <div className="space-y-4 min-w-0">
+      {/* Compact Mode Switcher */}
+      <div className="madar-glass rounded-2xl p-2 flex items-center gap-1.5">
+        <button
+          type="button"
+          onClick={() => setExecMode('auto')}
+          className={`flex-1 py-2 text-xs font-bold rounded-xl min-h-[40px] transition-colors ${
+            execMode === 'auto' ? 'bg-[#38bdf8] text-slate-950' : 'text-slate-300 hover:text-white'
+          }`}
+        >
+          گرداننده خودکار
+        </button>
+        <button
+          type="button"
+          onClick={() => setExecMode('trimode')}
+          className={`flex-1 py-2 text-xs font-bold rounded-xl min-h-[40px] transition-colors ${
+            execMode === 'trimode' ? 'bg-[#38bdf8] text-slate-950' : 'text-slate-300 hover:text-white'
+          }`}
+        >
+          همگام گروه تلگرام
+        </button>
       </div>
 
       {err && (
-        <div className="rounded-xl border border-rose-500/40 bg-rose-500/10 px-4 py-3 text-xs text-rose-200">
+        <div className="rounded-xl border border-rose-500/40 bg-rose-500/10 px-4 py-2.5 text-xs text-rose-200">
           {err}
         </div>
       )}
 
       {execMode === 'trimode' ? (
-        <div className="madar-glass rounded-3xl p-5 sm:p-6 space-y-5">
+        <div className="madar-glass rounded-3xl p-4 sm:p-6 space-y-4">
           {!syncRoom ? (
-            <div className="max-w-2xl mx-auto space-y-4">
-              <p className="text-xs sm:text-sm text-slate-300 leading-relaxed">
-                در معماری سه‌حالته تلگرام، بازیکنان با دکمه‌های شیشه‌ای در گروه رأی می‌دهند، نقش محرمانه فقط در پی‌وی ربات تحویل می‌شود و تابلوی شهر در Mini App زنده می‌ماند.
-              </p>
+            <div className="space-y-4">
+              <p className="text-xs text-slate-300">نام حداقل ۶ بازیکن را با کاما وارد کن:</p>
               <textarea
                 rows={2}
                 value={namesInput}
                 onChange={(e) => setNamesInput(e.target.value)}
-                className="w-full rounded-xl border border-indigo-500/30 bg-[#050816] p-3 text-base sm:text-sm text-white"
+                className="w-full rounded-xl border border-[#23303e] bg-[#0e1621] p-3 text-base sm:text-sm text-white"
               />
               <button
                 type="button"
                 disabled={busy}
                 onClick={createTriModeRoom}
-                className="inline-flex items-center gap-2 rounded-xl bg-cyan-400 px-6 py-3 text-sm font-bold text-slate-950 hover:bg-cyan-300 min-h-[46px]"
+                className="w-full inline-flex items-center justify-center gap-2 rounded-xl bg-[#38bdf8] px-5 py-3 text-sm font-bold text-slate-950 min-h-[46px]"
               >
                 <Play className="w-4 h-4" />
-                <span>{busy ? 'در حال ایجاد...' : 'ساخت اتاق همگام تلگرام'}</span>
+                <span>{busy ? 'در حال ایجاد...' : 'ساخت اتاق همگام'}</span>
               </button>
             </div>
           ) : (
             <div className="space-y-4">
-              <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+              <div className="flex items-center justify-between gap-2 text-xs">
                 <span>
-                  کد اتاق: <strong className="font-mono text-amber-300">{syncRoom.roomCode}</strong> · روز{' '}
+                  اتاق <strong className="font-mono text-[#38bdf8]">{syncRoom.roomCode}</strong> · روز{' '}
                   <strong className="font-mono text-white">{syncRoom.dayNumber}</strong>
                 </span>
                 <button
@@ -320,21 +338,21 @@ export default function MafiaArena({
                     setSyncRoom(null);
                     setDmRole(null);
                   }}
-                  className="rounded-lg border border-slate-700 px-3 py-1.5 text-xs text-slate-300"
+                  className="rounded-lg border border-[#23303e] px-3 py-1.5 text-xs text-slate-300"
                 >
-                  بستن اتاق
+                  بستن
                 </button>
               </div>
-              <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-                <div className="rounded-2xl border border-sky-500/30 bg-[#050816] p-4 space-y-3">
-                  <div className="flex items-center gap-1.5 text-xs font-bold text-sky-300">
+              <div className="grid grid-cols-1 lg:grid-cols-3 gap-3.5">
+                <div className="rounded-2xl border border-[#23303e] bg-[#0e1621] p-3.5 space-y-3">
+                  <div className="flex items-center gap-1.5 text-xs font-bold text-[#38bdf8]">
                     <MessageSquare className="w-4 h-4" />
-                    <span>۱. گروه تلگرام</span>
+                    <span>رأی گروه</span>
                   </div>
                   <select
                     value={activeVoterId}
                     onChange={(e) => setActiveVoterId(e.target.value)}
-                    className="w-full rounded-lg border border-slate-700 bg-[#0a1026] px-2.5 py-2 text-xs text-white"
+                    className="w-full rounded-lg border border-[#23303e] bg-[#17212b] px-2.5 py-2 text-xs text-white"
                   >
                     {syncRoom.players.filter((p) => p.alive).map((p) => (
                       <option key={p.id} value={p.id}>
@@ -342,34 +360,34 @@ export default function MafiaArena({
                       </option>
                     ))}
                   </select>
-                  <div className="grid grid-cols-2 gap-2">
+                  <div className="grid grid-cols-2 gap-1.5">
                     {syncRoom.players.filter((p) => p.alive).map((p) => (
                       <button
                         key={p.id}
                         type="button"
                         onClick={() => castSyncedVote(p.id)}
-                        className="rounded-lg border border-sky-400/40 bg-sky-400/10 py-2 text-xs text-sky-100 hover:bg-sky-400 hover:text-slate-950 min-h-[38px]"
+                        className="rounded-lg border border-[#23303e] bg-[#17212b] py-2 text-xs text-slate-100 hover:border-[#38bdf8] min-h-[38px]"
                       >
-                        رأی به {p.name}
+                        {p.name}
                       </button>
                     ))}
                   </div>
                 </div>
 
-                <div className="rounded-2xl border border-amber-400/35 bg-[#050816] p-4 space-y-3 flex flex-col justify-between">
+                <div className="rounded-2xl border border-[#23303e] bg-[#0e1621] p-3.5 space-y-3 flex flex-col justify-between">
                   <div className="space-y-2">
                     <div className="flex items-center gap-1.5 text-xs font-bold text-amber-300">
                       <Lock className="w-4 h-4" />
-                      <span>۲. پی‌وی ربات (نقش محرمانه)</span>
+                      <span>نقش محرمانه پی‌وی</span>
                     </div>
                     {dmRole ? (
-                      <div className="rounded-xl border border-amber-400/40 bg-amber-400/10 p-3 space-y-1">
+                      <div className="rounded-xl border border-amber-400/35 bg-amber-400/10 p-3 space-y-1">
                         <p className="text-[11px] text-amber-200">{dmRole.playerName} · {dmRole.team}</p>
                         <p className="text-base font-bold text-white">{dmRole.roleTitle}</p>
                         <p className="text-xs text-slate-300">{dmRole.description}</p>
                       </div>
                     ) : (
-                      <p className="text-xs text-slate-400">نقش محرمانه مهروموم شده است.</p>
+                      <p className="text-xs text-slate-400">نقش مخفی است.</p>
                     )}
                   </div>
                   <button
@@ -378,20 +396,20 @@ export default function MafiaArena({
                     className="w-full inline-flex items-center justify-center gap-1.5 rounded-xl bg-amber-400 py-2.5 text-xs font-bold text-slate-950 min-h-[42px]"
                   >
                     <Smartphone className="w-4 h-4" />
-                    <span>مشاهده نقش در پی‌وی</span>
+                    <span>نمایش نقش این بازیکن</span>
                   </button>
                 </div>
 
-                <div className="rounded-2xl border border-emerald-500/30 bg-[#050816] p-4 space-y-3 flex flex-col justify-between">
-                  <div className="space-y-2">
+                <div className="rounded-2xl border border-[#23303e] bg-[#0e1621] p-3.5 space-y-3 flex flex-col justify-between">
+                  <div className="space-y-1.5">
                     <div className="flex items-center gap-1.5 text-xs font-bold text-emerald-300">
                       <Monitor className="w-4 h-4" />
-                      <span>۳. تابلوی زنده Mini App</span>
+                      <span>تابلوی آرا</span>
                     </div>
                     {syncRoom.players.map((p) => {
                       const votesCount = Object.values(syncRoom.votes).filter((v) => v === p.id).length;
                       return (
-                        <div key={p.id} className="flex items-center justify-between text-xs py-1 border-b border-slate-800/70">
+                        <div key={p.id} className="flex items-center justify-between text-xs py-1 border-b border-[#23303e]">
                           <span className={p.alive ? 'text-slate-100' : 'text-slate-500 line-through'}>{p.name}</span>
                           <span className="font-mono text-amber-300">{p.alive ? `${votesCount} رأی` : 'حذف'}</span>
                         </div>
@@ -403,7 +421,7 @@ export default function MafiaArena({
                     onClick={resolveSyncedVotes}
                     className="w-full rounded-xl border border-emerald-400/50 bg-emerald-400/15 py-2.5 text-xs font-semibold text-emerald-200 hover:bg-emerald-400 hover:text-slate-950 min-h-[42px]"
                   >
-                    شمارش آرا و پایان روز
+                    شمارش آرا
                   </button>
                 </div>
               </div>
@@ -411,44 +429,35 @@ export default function MafiaArena({
           )}
         </div>
       ) : !mafia || !room ? (
-        /* ==================== AUTO-MODERATED MAFIA LOBBY ==================== */
-        <div className="madar-glass rounded-3xl p-5 sm:p-8 space-y-6">
-          <div className="space-y-1.5 pb-4 border-b border-indigo-500/20">
-            <p className="text-xs text-purple-300">گرداننده خودکار سمت سرور · بدون نیاز به راوی</p>
-            <h2 className="text-xl sm:text-2xl font-bold text-white">لابی مافیای خودکار مدار</h2>
-            <p className="text-xs sm:text-sm text-slate-300 leading-relaxed">
-              توزیع امن نقش‌ها، مدیریت چرخه شب و روز، اکشن نقش‌های ویژه، رأی‌گیری هوشمند ربات‌ها و تشخیص برنده کاملاً به‌صورت خودکار انجام می‌شود.
-            </p>
-          </div>
-
+        <div className="madar-glass rounded-3xl p-5 sm:p-6 space-y-5">
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             {[
-              { id: 'classic', title: 'سناریوی کلاسیک مدار', desc: 'شهروند، مافیا، دکتر، کارآگاه (۶+ نفر)' },
-              { id: 'tactical', title: 'سناریوی تاکتیکی', desc: 'کلاسیک + تک‌تیرانداز (۷+ نفر)' },
+              { id: 'classic', title: 'سناریوی کلاسیک', desc: 'شهروند، مافیا، دکتر، کارآگاه' },
+              { id: 'tactical', title: 'سناریوی تاکتیکی', desc: 'کلاسیک + تک‌تیرانداز' },
             ].map((sc) => (
               <button
                 key={sc.id}
                 type="button"
                 onClick={() => setScenario(sc.id as 'classic' | 'tactical')}
-                className={`rounded-2xl border p-4 text-right transition-colors min-h-[72px] ${
+                className={`rounded-2xl border p-4 text-right transition-colors min-h-[68px] ${
                   scenario === sc.id
-                    ? 'border-amber-400 bg-amber-400/15 text-white'
-                    : 'border-indigo-500/25 bg-[#050816] text-slate-300 hover:border-purple-400/50'
+                    ? 'border-[#38bdf8] bg-[#38bdf8]/12 text-white'
+                    : 'border-[#23303e] bg-[#0e1621] text-slate-300'
                 }`}
               >
                 <p className="text-sm font-bold">{sc.title}</p>
-                <p className="text-xs text-slate-400 mt-1">{sc.desc}</p>
+                <p className="text-xs text-slate-400 mt-0.5">{sc.desc}</p>
               </button>
             ))}
           </div>
 
-          <div className="space-y-2">
-            <label className="text-xs text-slate-300 block">نام هم‌تیمی‌ها / ربات‌های میز (با کاما):</label>
+          <div className="space-y-1.5">
+            <label className="text-xs text-slate-300 block">نام بازیکنان میز (با کاما)</label>
             <input
               type="text"
               value={namesInput}
               onChange={(e) => setNamesInput(e.target.value)}
-              className="w-full rounded-xl border border-indigo-500/30 bg-[#050816] px-3.5 py-2.5 text-base sm:text-sm text-white"
+              className="w-full rounded-xl border border-[#23303e] bg-[#0e1621] px-3.5 py-2.5 text-base sm:text-sm text-white"
             />
           </div>
 
@@ -456,50 +465,44 @@ export default function MafiaArena({
             type="button"
             disabled={busy}
             onClick={startAutoMafia}
-            className="w-full sm:w-auto inline-flex items-center justify-center gap-2 rounded-xl bg-gradient-to-l from-purple-500 to-indigo-500 px-7 py-3 text-sm font-bold text-white hover:brightness-110 min-h-[48px]"
+            className="w-full inline-flex items-center justify-center gap-2 rounded-xl bg-[#8b5cf6] px-6 py-3.5 text-sm font-bold text-white hover:brightness-110 min-h-[48px]"
           >
             <Play className="w-4 h-4" />
-            <span>{busy ? 'در حال توزیع نقش‌ها...' : 'شروع مافیا با گرداننده خودکار'}</span>
+            <span>{busy ? 'در حال توزیع نقش‌ها...' : 'شروع مافیا'}</span>
           </button>
         </div>
       ) : (
-        /* ==================== ACTIVE AUTO-MODERATED MAFIA TABLE ==================== */
         <div
-          className={`rounded-3xl border p-4 sm:p-6 space-y-5 transition-colors duration-500 ${
-            isNight
-              ? 'border-purple-500/40 bg-gradient-to-b from-[#0b0724] via-[#070a1e] to-[#050816]'
-              : 'border-amber-400/35 bg-gradient-to-b from-[#17122c] via-[#0c1430] to-[#060b1d]'
+          className={`rounded-3xl border p-4 sm:p-5 space-y-4 ${
+            isNight ? 'border-purple-500/35 bg-[#121629]' : 'border-[#23303e] bg-[#17212b]'
           }`}
         >
-          {/* Phase Atmospheric Banner */}
-          <div className="flex flex-wrap items-center justify-between gap-3 pb-4 border-b border-white/10">
-            <div className="flex items-center gap-3">
+          <div className="flex items-center justify-between gap-2 pb-3 border-b border-[#23303e]">
+            <div className="flex items-center gap-2.5 min-w-0">
               <div
-                className={`w-11 h-11 rounded-2xl flex items-center justify-center shrink-0 ${
-                  isNight ? 'bg-purple-500/20 text-purple-300' : 'bg-amber-400/20 text-amber-300'
+                className={`w-10 h-10 rounded-xl flex items-center justify-center shrink-0 ${
+                  isNight ? 'bg-purple-500/20 text-purple-300' : 'bg-amber-400/15 text-amber-300'
                 }`}
               >
                 {isNight ? <Moon className="w-5 h-5" /> : <Sun className="w-5 h-5" />}
               </div>
-              <div>
-                <p className="text-xs text-slate-300 font-mono">
-                  {room.roomCode} · روز {mafia.dayNumber}
-                </p>
-                <h3 className="text-base sm:text-lg font-bold text-white">
+              <div className="min-w-0">
+                <p className="text-[11px] text-slate-400 font-mono">روز {mafia.dayNumber}</p>
+                <h3 className="text-sm sm:text-base font-bold text-white truncate">
                   {mafia.phase === 'NIGHT_ACTION'
-                    ? 'فاز شب — زمان حرکت نقش‌های مخفی'
+                    ? 'فاز شب'
                     : mafia.phase === 'DAY_DISCUSSION'
-                      ? 'فاز روز — گزارش صبح و بررسی سرنخ‌ها'
+                      ? 'فاز روز و بحث'
                       : mafia.phase === 'VOTING'
-                        ? 'فاز رأی‌گیری — انتخاب فرد مشکوک'
-                        : 'پایان بازی مافیا'}
+                        ? 'فاز رأی‌گیری'
+                        : 'پایان بازی'}
                 </h3>
               </div>
             </div>
 
-            <div className="flex items-center gap-2.5">
+            <div className="flex items-center gap-2 shrink-0">
               {mafia.phase !== 'GAME_OVER' && (
-                <span className="inline-flex items-center gap-1.5 font-mono tabular-nums text-xs text-cyan-300 bg-[#050816] border border-cyan-500/30 rounded-lg px-3 py-1.5">
+                <span className="inline-flex items-center gap-1 font-mono tabular-nums text-xs text-[#38bdf8] bg-[#0e1621] border border-[#23303e] rounded-lg px-2.5 py-1.5">
                   <Timer className="w-3.5 h-3.5" />
                   {secondsLeft}s
                 </span>
@@ -507,36 +510,23 @@ export default function MafiaArena({
               <button
                 type="button"
                 onClick={() => onRoomChange(null)}
-                className="inline-flex items-center gap-1 rounded-lg border border-slate-700 px-3 py-1.5 text-xs text-slate-300 hover:text-white min-h-[36px]"
+                className="inline-flex items-center gap-1 rounded-lg border border-[#23303e] px-2.5 py-1.5 text-xs text-slate-300 hover:text-white min-h-[34px]"
               >
                 <RotateCcw className="w-3.5 h-3.5" />
-                <span>خروج</span>
+                <span>جدید</span>
               </button>
             </div>
           </div>
 
-          <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 items-start">
-            {/* Circular Town Table */}
-            <div className="lg:col-span-7 space-y-4">
-              <div className="relative w-full max-w-[380px] aspect-square mx-auto flex items-center justify-center">
-                <div
-                  className={`pointer-events-none absolute inset-[10%] rounded-full border-2 ${
-                    isNight
-                      ? 'border-purple-400/30 bg-[#090620]/85 shadow-[0_0_50px_rgba(124,58,237,0.2)]'
-                      : 'border-amber-400/30 bg-[#0d1430]/85 shadow-[0_0_50px_rgba(245,158,11,0.12)]'
-                  }`}
-                />
-
-                {/* Center Moderator Emblem */}
-                <div className="relative z-10 text-center max-w-[165px] space-y-1 px-2">
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 items-start">
+            <div className="lg:col-span-7">
+              <div className="relative w-full max-w-[340px] aspect-square mx-auto flex items-center justify-center">
+                <div className="pointer-events-none absolute inset-[10%] rounded-full border border-[#23303e] bg-[#0e1621]/90" />
+                <div className="relative z-10 text-center space-y-1">
                   <Shield className={`w-6 h-6 mx-auto ${isNight ? 'text-purple-300' : 'text-amber-300'}`} />
-                  <p className="text-[11px] font-semibold text-white">گرداننده خودکار</p>
-                  <p className="text-[10px] text-slate-300 leading-relaxed">
-                    بازیکنان زنده: <strong className="font-mono text-cyan-300">{mafia.aliveIds.length}</strong> نفر
-                  </p>
+                  <p className="text-xs font-mono text-[#38bdf8]">{mafia.aliveIds.length} زنده</p>
                 </div>
 
-                {/* Players Arranged Around Circle */}
                 {room.players.map((p, idx) => {
                   const deg = (360 / room.players.length) * idx;
                   const rad = ((deg - 90) * Math.PI) / 180;
@@ -555,12 +545,12 @@ export default function MafiaArena({
                       className="absolute -translate-x-1/2 -translate-y-1/2 z-20 flex flex-col items-center cursor-pointer disabled:cursor-default"
                     >
                       <div
-                        className={`w-11 h-11 rounded-full flex items-center justify-center text-xs font-bold text-white border-2 transition-all ${
+                        className={`w-10 h-10 rounded-full flex items-center justify-center text-xs font-bold text-white border-2 transition-all ${
                           !alive
-                            ? 'opacity-35 grayscale border-slate-700'
+                            ? 'opacity-30 grayscale border-slate-700'
                             : isPicked
-                              ? 'border-amber-400 scale-110 shadow-[0_0_20px_rgba(245,158,11,0.65)]'
-                              : 'border-cyan-400/40 hover:border-white'
+                              ? 'border-amber-400 scale-110'
+                              : 'border-[#23303e] hover:border-[#38bdf8]'
                         }`}
                         style={{ backgroundColor: p.avatarColor }}
                       >
@@ -572,13 +562,13 @@ export default function MafiaArena({
                             ? 'bg-slate-900/80 text-slate-500 line-through'
                             : isPicked
                               ? 'bg-amber-400 text-slate-950'
-                              : 'bg-[#050816]/90 text-slate-100'
+                              : 'bg-[#0e1621]/95 text-slate-100'
                         }`}
                       >
                         {p.name}
                       </span>
                       {revealed && (
-                        <span className="text-[9px] text-amber-300 bg-[#050816]/90 px-1 rounded mt-0.5">
+                        <span className="text-[9px] text-amber-300 bg-[#0e1621] px-1 rounded mt-0.5">
                           {revealed.title}
                         </span>
                       )}
@@ -588,74 +578,51 @@ export default function MafiaArena({
               </div>
             </div>
 
-            {/* Right Control Column: Secret Role Card + Action Console + Log */}
-            <div className="lg:col-span-5 space-y-4">
-              {/* Secret Role Card (Flip / Tap to Peek) */}
+            <div className="lg:col-span-5 space-y-3.5">
               {myRole && (
                 <motion.div
                   layout={!liteMode}
-                  className="rounded-2xl border border-amber-400/35 bg-[#050816]/90 p-4 space-y-2.5"
+                  className="rounded-2xl border border-amber-400/35 bg-[#0e1621] p-3.5 space-y-2"
                 >
-                  <div className="flex items-center justify-between gap-2">
-                    <span className="text-xs font-bold text-amber-300">کارت نقش محرمانه شما</span>
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-bold text-amber-300">نقش مخفی شما</span>
                     <button
                       type="button"
                       onClick={() => setRoleRevealed((v) => !v)}
-                      className="inline-flex items-center gap-1 text-xs text-cyan-300 hover:text-white min-h-[34px]"
+                      className="inline-flex items-center gap-1 text-xs text-[#38bdf8] min-h-[32px]"
                     >
                       {roleRevealed ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
-                      <span>{roleRevealed ? 'مخفی کردن' : 'مشاهده نقش'}</span>
+                      <span>{roleRevealed ? 'مخفی' : 'نمایش'}</span>
                     </button>
                   </div>
                   {roleRevealed ? (
-                    <div className="space-y-1">
-                      <p className="text-lg font-bold text-white">
-                        {myRole.title}{' '}
-                        <span className="text-xs font-normal text-purple-300">({myRole.team})</span>
-                      </p>
-                      <p className="text-xs text-slate-300 leading-relaxed">{myRole.description}</p>
+                    <div>
+                      <p className="text-base font-bold text-white">{myRole.title}</p>
+                      <p className="text-xs text-slate-400 mt-0.5">{myRole.description}</p>
                     </div>
                   ) : (
-                    <p className="text-xs text-slate-400">
-                      برای جلوگیری از دیده‌شدن روی صفحه، کارت نقش مخفی است. برای دیدن لمس کن.
-                    </p>
+                    <p className="text-xs text-slate-500">برای مشاهده لمس کن</p>
                   )}
                   {mafia.detectiveIntel && (
-                    <div className="rounded-xl border border-cyan-400/40 bg-cyan-400/10 p-2.5 text-xs text-cyan-100">
+                    <div className="rounded-xl border border-[#38bdf8]/40 bg-[#38bdf8]/10 p-2.5 text-xs text-sky-100">
                       {mafia.detectiveIntel}
                     </div>
                   )}
                 </motion.div>
               )}
 
-              {/* Phase Action Card */}
-              <div className="madar-glass rounded-2xl p-4 space-y-3.5">
+              <div className="rounded-2xl border border-[#23303e] bg-[#0e1621] p-4 space-y-3">
                 <p className="text-xs text-slate-200 leading-relaxed">{mafia.nightSummary}</p>
 
                 {mafia.phase === 'NIGHT_ACTION' && (
-                  <div className="space-y-3">
-                    {needsNightTarget ? (
-                      <p className="text-xs text-purple-200">
-                        یک بازیکن زنده را از روی میز دایره‌ای انتخاب کن تا اکشن شب نقش ({myRole?.title}) ثبت شود:
-                      </p>
-                    ) : (
-                      <p className="text-xs text-slate-400">
-                        شما در این شب استراحت می‌کنید. برای پایان شب و اجرای اکشن خودکار نقش‌ها دکمه زیر را بزنید.
-                      </p>
-                    )}
-                    <button
-                      type="button"
-                      disabled={busy || (Boolean(needsNightTarget) && !selectedTarget)}
-                      onClick={submitNightAction}
-                      className="w-full rounded-xl bg-purple-500 py-3 text-xs sm:text-sm font-bold text-white hover:bg-purple-400 disabled:opacity-50 min-h-[46px]"
-                    >
-                      {busy
-                        ? 'در حال پردازش شب...'
-                        : needsNightTarget
-                          ? 'تأیید هدف شب و طلوع روز'
-                          : 'ادامه شب و طلوع روز'}
-                    </button>
-                  </div>
+                  <button
+                    type="button"
+                    disabled={busy || (Boolean(needsNightTarget) && !selectedTarget)}
+                    onClick={submitNightAction}
+                    className="w-full rounded-xl bg-[#8b5cf6] py-3 text-xs sm:text-sm font-bold text-white hover:brightness-110 disabled:opacity-50 min-h-[44px]"
+                  >
+                    {busy ? 'در حال ثبت...' : needsNightTarget ? 'تأیید هدف شب' : 'پایان شب'}
+                  </button>
                 )}
 
                 {mafia.phase === 'DAY_DISCUSSION' && (
@@ -663,63 +630,55 @@ export default function MafiaArena({
                     type="button"
                     disabled={busy}
                     onClick={startVoting}
-                    className="w-full inline-flex items-center justify-center gap-2 rounded-xl bg-amber-400 py-3 text-sm font-bold text-slate-950 hover:bg-amber-300 min-h-[46px]"
+                    className="w-full inline-flex items-center justify-center gap-2 rounded-xl bg-amber-400 py-3 text-xs sm:text-sm font-bold text-slate-950 min-h-[44px]"
                   >
                     <Vote className="w-4 h-4" />
-                    <span>شروع رأی‌گیری خودکار شهر</span>
+                    <span>شروع رأی‌گیری</span>
                   </button>
                 )}
 
                 {mafia.phase === 'VOTING' && (
-                  <div className="space-y-2.5">
-                    <p className="text-xs text-amber-200">روی نام فرد مشکوک بزن تا رأی خود را ثبت کنی:</p>
-                    <div className="grid grid-cols-2 gap-2">
-                      {room.players
-                        .filter((p) => mafia.aliveIds.includes(p.id))
-                        .map((p) => (
-                          <button
-                            key={p.id}
-                            type="button"
-                            disabled={busy}
-                            onClick={() => castVote(p.id)}
-                            className="rounded-xl border border-amber-400/40 bg-[#050816] hover:bg-amber-400 hover:text-slate-950 py-2.5 px-3 text-xs font-semibold text-white transition-colors min-h-[42px]"
-                          >
-                            رأی به {p.name}
-                          </button>
-                        ))}
-                    </div>
+                  <div className="grid grid-cols-2 gap-2">
+                    {room.players
+                      .filter((p) => mafia.aliveIds.includes(p.id))
+                      .map((p) => (
+                        <button
+                          key={p.id}
+                          type="button"
+                          disabled={busy}
+                          onClick={() => castVote(p.id)}
+                          className="rounded-xl border border-[#23303e] bg-[#17212b] hover:border-amber-400 py-2.5 px-2 text-xs font-semibold text-white min-h-[40px]"
+                        >
+                          رأی به {p.name}
+                        </button>
+                      ))}
                   </div>
                 )}
 
                 {mafia.phase === 'GAME_OVER' && (
-                  <div className="text-center space-y-3 py-2">
-                    <Trophy className="w-9 h-9 text-amber-400 mx-auto" />
-                    <p className="text-base font-bold text-white">
-                      {mafia.winner === 'citizens' ? 'پیروزی تیم شهروندان!' : 'پیروزی تیم مافیا!'}
+                  <div className="text-center space-y-2.5">
+                    <Trophy className="w-8 h-8 text-amber-400 mx-auto" />
+                    <p className="text-sm font-bold text-white">
+                      {mafia.winner === 'citizens' ? 'پیروزی شهروندان!' : 'پیروزی مافیا!'}
                     </p>
-                    <p className="text-xs text-slate-300">نقش واقعی همه بازیکنان روی میز دایره‌ای آشکار شد.</p>
                     <button
                       type="button"
                       onClick={startAutoMafia}
-                      className="w-full rounded-xl bg-amber-400 py-3 text-sm font-bold text-slate-950 hover:bg-amber-300 min-h-[46px]"
+                      className="w-full rounded-xl bg-amber-400 py-3 text-xs font-bold text-slate-950 min-h-[44px]"
                     >
-                      شروع دور جدید مافیا
+                      دور جدید
                     </button>
                   </div>
                 )}
               </div>
 
-              {/* Event Log */}
-              <div className="rounded-2xl border border-indigo-500/20 bg-[#050816] p-3.5 space-y-2">
-                <p className="text-xs font-bold text-slate-400">گزارش گرداننده خودکار</p>
-                <div className="space-y-1.5 max-h-36 overflow-y-auto madar-scroll-y">
-                  {mafia.log.slice(0, 8).map((ev, idx) => (
-                    <div key={idx} className="text-xs text-slate-300 leading-relaxed flex justify-between gap-2">
-                      <span>{ev.text}</span>
-                      <span className="font-mono text-[10px] text-slate-500 shrink-0">{ev.at}</span>
-                    </div>
-                  ))}
-                </div>
+              <div className="rounded-2xl border border-[#23303e] bg-[#0e1621] p-3 space-y-1.5 max-h-32 overflow-y-auto madar-scroll-y">
+                {mafia.log.slice(0, 6).map((ev, idx) => (
+                  <div key={idx} className="text-[11px] text-slate-300 flex justify-between gap-2">
+                    <span>{ev.text}</span>
+                    <span className="font-mono text-[10px] text-slate-500 shrink-0">{ev.at}</span>
+                  </div>
+                ))}
               </div>
             </div>
           </div>

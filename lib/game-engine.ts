@@ -12,8 +12,18 @@ import {
 } from './hokm-engine';
 import { MAFIA_ROLE_META, MafiaRole } from './mafia-engine';
 import { calculateAge } from './security';
+import { ADULT_TD_CATEGORY } from './truth-dare-prompts';
 
 export type EngineGameType = 'hokm' | 'mafia' | 'quiz' | 'truth_dare';
+
+export class GameEngineError extends Error {
+  statusCode: number;
+  constructor(message: string, statusCode = 400) {
+    super(message);
+    this.name = 'GameEngineError';
+    this.statusCode = statusCode;
+  }
+}
 
 export interface EnginePlayer {
   id: string;
@@ -99,6 +109,7 @@ export interface EngineRoomState {
   hostUserId: number;
   players: EnginePlayer[];
   rewardClaimedBy: number[];
+  hokmTurnDeadline?: number | null;
   hokm?: HokmState;
   mafia?: AutoMafiaState;
   truthDare?: TruthDareEngineState;
@@ -114,6 +125,13 @@ const BOT_AVATARS = [
   { name: 'سپهر', initials: 'سف', color: '#b45309' },
   { name: 'مهسا', initials: 'مر', color: '#7e22ce' },
 ];
+
+const HOKM_TURN_MS = 35_000;
+const MAFIA_NIGHT_MS = 45_000;
+const MAFIA_DAY_MS = 60_000;
+const MAFIA_VOTE_MS = 35_000;
+const TD_CHOOSE_MS = 45_000;
+const TD_PROMPT_MS = 60_000;
 
 function nowTimeLabel(): string {
   return new Date().toISOString().slice(11, 19);
@@ -131,6 +149,14 @@ function cryptoShuffle<T>(items: T[]): T[] {
 export function cleanupExpiredEngineRooms() {
   const db = getDb();
   db.prepare("DELETE FROM engine_rooms WHERE expires_at < datetime('now')").run();
+}
+
+export function assertRoomMember(state: EngineRoomState, userId: number): EnginePlayer {
+  const player = state.players.find((p) => p.userId === userId && p.status !== 'left');
+  if (!player) {
+    throw new GameEngineError('شما عضو این اتاق بازی نیستید. ابتدا با کد اتاق وارد شوید.', 403);
+  }
+  return player;
 }
 
 export function checkUserAdultVerified(userId: number): boolean {
@@ -161,7 +187,14 @@ export function checkUserAdultVerified(userId: number): boolean {
   );
 }
 
-function awardMatchStarsOnce(state: EngineRoomState, userId: number, gameType: EngineGameType, score: number, resultText: string, won: boolean) {
+function awardMatchStarsOnce(
+  state: EngineRoomState,
+  userId: number,
+  gameType: EngineGameType,
+  score: number,
+  resultText: string,
+  won: boolean
+) {
   if (state.rewardClaimedBy.includes(userId)) return null;
   state.rewardClaimedBy.push(userId);
   const stars = won ? 25 : 10;
@@ -177,7 +210,7 @@ function awardMatchStarsOnce(state: EngineRoomState, userId: number, gameType: E
       stars,
       'free',
       'game_reward',
-      `پاداش موتور خودکار ${gameType === 'hokm' ? 'حکم' : gameType === 'mafia' ? 'مافیا' : gameType === 'quiz' ? 'کوییز' : 'جرئت و حقیقت'} (${state.roomCode})`
+      `پاداش موتور بازی ${gameType === 'hokm' ? 'حکم' : gameType === 'mafia' ? 'مافیا' : gameType === 'quiz' ? 'کوییز' : 'جرئت و حقیقت'} (${state.roomCode})`
     );
   })();
   return stars;
@@ -188,7 +221,7 @@ function buildPlayersForGame(
   gameType: EngineGameType,
   customNames?: string[]
 ): EnginePlayer[] {
-  const minCount = gameType === 'hokm' ? 4 : gameType === 'mafia' ? 6 : gameType === 'truth_dare' ? 4 : 4;
+  const minCount = gameType === 'hokm' ? 4 : gameType === 'mafia' ? 6 : 4;
   const maxCount = gameType === 'hokm' ? 4 : gameType === 'mafia' ? 10 : gameType === 'truth_dare' ? 8 : 4;
 
   const players: EnginePlayer[] = [
@@ -197,7 +230,7 @@ function buildPlayersForGame(
       userId: host.id,
       name: host.displayName,
       avatarInitials: host.initials || host.displayName.slice(0, 2),
-      avatarColor: host.color || '#3b82f6',
+      avatarColor: host.color || '#38bdf8',
       isBot: false,
       score: 0,
       status: 'playing',
@@ -242,10 +275,15 @@ function buildPlayersForGame(
   return players;
 }
 
-function advanceHokmBotsUntilHuman(state: HokmState): HokmState {
-  let current = state;
+function isSeatHuman(players: EnginePlayer[], seat: Seat): boolean {
+  const p = players[seat];
+  return Boolean(p && !p.isBot && p.status !== 'left');
+}
+
+function advanceHokmBotsUntilHuman(hokm: HokmState, players: EnginePlayer[]): HokmState {
+  let current = hokm;
   let guard = 0;
-  while (current.phase === 'PLAYING' && current.turn !== 0 && guard < 20) {
+  while (current.phase === 'PLAYING' && !isSeatHuman(players, current.turn) && guard < 24) {
     guard++;
     const botCard = chooseBotCard(current, current.turn);
     if (!botCard) break;
@@ -254,12 +292,11 @@ function advanceHokmBotsUntilHuman(state: HokmState): HokmState {
   return current;
 }
 
-function initHokmState(targetHands = 3): HokmState {
+function initHokmState(players: EnginePlayer[], targetHands = 3): HokmState {
   const initialHakem = crypto.randomInt(0, 4) as Seat;
-  // Give the human player a smooth start: 70% chance human starts as Hakem on round 1 so they can pick trump, else fair random seat
   const chosenHakem: Seat = initialHakem === 3 ? 0 : initialHakem;
   const h = startNewHokmHand(chosenHakem, [0, 0], 1, targetHands);
-  return advanceHokmBotsUntilHuman(h);
+  return advanceHokmBotsUntilHuman(h, players);
 }
 
 function initAutoMafiaState(players: EnginePlayer[], scenario: 'classic' | 'tactical' = 'classic'): AutoMafiaState {
@@ -281,10 +318,10 @@ function initAutoMafiaState(players: EnginePlayer[], scenario: 'classic' | 'tact
     phase: 'NIGHT_ACTION',
     dayNumber: 1,
     scenario,
-    phaseEndsAt: Date.now() + 45_000,
+    phaseEndsAt: Date.now() + MAFIA_NIGHT_MS,
     roles,
     aliveIds: players.map((p) => p.id),
-    nightSummary: 'شب اول فرارسید. نقش‌ها به‌صورت خودکار و امن توسط موتور مدار توزیع شدند.',
+    nightSummary: 'شب اول شروع شد. نقش مخفی هر بازیکن به‌صورت اختصاصی صادر شد.',
     detectiveIntel: {},
     votes: {},
     winner: null,
@@ -292,7 +329,7 @@ function initAutoMafiaState(players: EnginePlayer[], scenario: 'classic' | 'tact
       {
         at: nowTimeLabel(),
         phase: 'NIGHT',
-        text: `موتور خودکار مافیا با ${count} بازیکن آغاز شد. نقش محرمانه هر بازیکن به‌صورت اختصاصی صادر شد.`,
+        text: `بازی مافیا با ${count} بازیکن آغاز شد.`,
       },
     ],
   };
@@ -386,6 +423,11 @@ export function createEngineRoom(params: {
     params.playerNames
   );
 
+  const safeCategory =
+    params.category === ADULT_TD_CATEGORY && !checkUserAdultVerified(params.hostUserId)
+      ? 'دوستانه'
+      : params.category;
+
   const state: EngineRoomState = {
     roomCode,
     gameType: params.gameType,
@@ -393,14 +435,16 @@ export function createEngineRoom(params: {
     hostUserId: params.hostUserId,
     players,
     rewardClaimedBy: [],
+    hokmTurnDeadline: null,
   };
 
   if (params.gameType === 'hokm') {
-    state.hokm = initHokmState(params.hokmTargetHands ?? 3);
+    state.hokm = initHokmState(players, params.hokmTargetHands ?? 3);
+    state.hokmTurnDeadline = state.hokm.phase === 'PLAYING' ? Date.now() + HOKM_TURN_MS : null;
   } else if (params.gameType === 'mafia') {
     state.mafia = initAutoMafiaState(players, params.mafiaScenario ?? 'classic');
   } else if (params.gameType === 'truth_dare') {
-    state.truthDare = initTruthDareState(params.category || 'دوستانه');
+    state.truthDare = initTruthDareState(safeCategory || 'دوستانه');
   } else if (params.gameType === 'quiz') {
     state.quiz = initQuizState(params.category || 'همه');
   }
@@ -414,6 +458,312 @@ export function createEngineRoom(params: {
   return state;
 }
 
+function checkAutoMafiaWinner(mafia: AutoMafiaState): 'citizens' | 'mafia' | null {
+  const aliveMafia = mafia.aliveIds.filter((id) => mafia.roles[id] === 'mafia').length;
+  const aliveCitizens = mafia.aliveIds.filter((id) => mafia.roles[id] !== 'mafia').length;
+  if (aliveMafia === 0) return 'citizens';
+  if (aliveMafia >= aliveCitizens) return 'mafia';
+  return null;
+}
+
+function resolveMafiaNightInternal(
+  state: EngineRoomState,
+  actorPlayer: EnginePlayer | null,
+  targetId?: string,
+  timedOut = false
+): number | null {
+  const mafia = state.mafia;
+  if (!mafia || mafia.phase !== 'NIGHT_ACTION') return null;
+
+  const actorRole = actorPlayer ? mafia.roles[actorPlayer.id] : null;
+  const aliveSet = new Set(mafia.aliveIds);
+  const aliveNonMafia = mafia.aliveIds.filter((id) => mafia.roles[id] !== 'mafia');
+
+  let mafiaTarget: string | null = null;
+  if (actorPlayer && aliveSet.has(actorPlayer.id) && actorRole === 'mafia' && targetId && aliveSet.has(targetId)) {
+    mafiaTarget = targetId;
+  } else if (aliveNonMafia.length > 0) {
+    mafiaTarget = aliveNonMafia[crypto.randomInt(0, aliveNonMafia.length)];
+  }
+
+  let doctorTarget: string | null = null;
+  const doctorId = mafia.aliveIds.find((id) => mafia.roles[id] === 'doctor');
+  if (doctorId) {
+    if (actorPlayer && doctorId === actorPlayer.id && targetId && aliveSet.has(targetId)) {
+      doctorTarget = targetId;
+    } else {
+      doctorTarget = mafia.aliveIds[crypto.randomInt(0, mafia.aliveIds.length)];
+    }
+  }
+
+  const detectiveId = mafia.aliveIds.find((id) => mafia.roles[id] === 'detective');
+  if (actorPlayer && detectiveId && detectiveId === actorPlayer.id && targetId && aliveSet.has(targetId)) {
+    const targetPlayer = state.players.find((p) => p.id === targetId);
+    const isMafia = mafia.roles[targetId] === 'mafia';
+    mafia.detectiveIntel[actorPlayer.id] = `استعلام «${targetPlayer?.name}»: ${
+      isMafia ? 'عضو تیم مافیاست!' : 'شهروند است.'
+    }`;
+  }
+
+  let sniperMsg = '';
+  if (
+    actorPlayer &&
+    aliveSet.has(actorPlayer.id) &&
+    actorRole === 'sniper' &&
+    targetId &&
+    targetId !== actorPlayer.id &&
+    aliveSet.has(targetId)
+  ) {
+    const targetPlayer = state.players.find((p) => p.id === targetId);
+    if (mafia.roles[targetId] === 'mafia') {
+      mafia.aliveIds = mafia.aliveIds.filter((id) => id !== targetId);
+      sniperMsg = ` تک‌تیرانداز «${targetPlayer?.name}» (مافیا) را حذف کرد!`;
+    } else {
+      mafia.aliveIds = mafia.aliveIds.filter((id) => id !== actorPlayer.id);
+      sniperMsg = ` تک‌تیرانداز اشتباه شلیک کرد و حذف شد!`;
+    }
+  }
+
+  let summary = `صبح روز ${mafia.dayNumber}: شب بدون کشته گذشت (دکتر نجات داد).`;
+  if (mafiaTarget && mafiaTarget !== doctorTarget && mafia.aliveIds.includes(mafiaTarget)) {
+    mafia.aliveIds = mafia.aliveIds.filter((id) => id !== mafiaTarget);
+    const victim = state.players.find((p) => p.id === mafiaTarget);
+    summary = `صبح روز ${mafia.dayNumber}: «${victim?.name}» در شب از بازی خارج شد.`;
+  }
+  if (timedOut) {
+    summary = `[پایان زمان شب] ${summary}`;
+  }
+  summary += sniperMsg;
+
+  state.players = state.players.map((p) => ({
+    ...p,
+    status: mafia.aliveIds.includes(p.id) ? 'playing' : 'eliminated',
+  }));
+
+  mafia.nightSummary = summary;
+  mafia.log.unshift({ at: nowTimeLabel(), phase: 'DAY', text: summary });
+
+  const winner = checkAutoMafiaWinner(mafia);
+  let starsAwarded: number | null = null;
+  if (winner) {
+    mafia.winner = winner;
+    mafia.phase = 'GAME_OVER';
+    if (actorPlayer?.userId) {
+      const humanWon =
+        (winner === 'citizens' && actorRole !== 'mafia') || (winner === 'mafia' && actorRole === 'mafia');
+      starsAwarded = awardMatchStarsOnce(
+        state,
+        actorPlayer.userId,
+        'mafia',
+        humanWon ? 260 : 100,
+        winner === 'citizens' ? 'پیروزی شهروندان در مافیا' : 'پیروزی مافیا',
+        humanWon
+      );
+    }
+  } else {
+    mafia.phase = 'DAY_DISCUSSION';
+    mafia.phaseEndsAt = Date.now() + MAFIA_DAY_MS;
+  }
+  return starsAwarded;
+}
+
+function resolveMafiaVoteInternal(
+  state: EngineRoomState,
+  actorPlayer: EnginePlayer | null,
+  targetId?: string,
+  timedOut = false
+): number | null {
+  const mafia = state.mafia;
+  if (!mafia || mafia.phase !== 'VOTING') return null;
+
+  if (actorPlayer && targetId && mafia.aliveIds.includes(actorPlayer.id) && mafia.aliveIds.includes(targetId)) {
+    mafia.votes[actorPlayer.id] = targetId;
+  }
+
+  // Bots (and any unvoted players on timeout) cast votes
+  for (const pid of mafia.aliveIds) {
+    if (mafia.votes[pid]) continue;
+    const pObj = state.players.find((p) => p.id === pid);
+    if (!timedOut && pObj && !pObj.isBot && actorPlayer && pid !== actorPlayer.id) {
+      // Other human hasn't voted yet — bots still vote below
+    }
+    const role = mafia.roles[pid];
+    const candidates = mafia.aliveIds.filter(
+      (cid) => cid !== pid && (role === 'mafia' ? mafia.roles[cid] !== 'mafia' : true)
+    );
+    if (candidates.length > 0) {
+      mafia.votes[pid] = candidates[crypto.randomInt(0, candidates.length)];
+    }
+  }
+
+  const tally = new Map<string, number>();
+  for (const votedId of Object.values(mafia.votes)) {
+    tally.set(votedId, (tally.get(votedId) ?? 0) + 1);
+  }
+  let topId: string | null = null;
+  let topVotes = 0;
+  let tied = false;
+  for (const [cid, count] of tally.entries()) {
+    if (count > topVotes) {
+      topId = cid;
+      topVotes = count;
+      tied = false;
+    } else if (count === topVotes) {
+      tied = true;
+    }
+  }
+
+  let outcomeText = `رأی‌گیری روز ${mafia.dayNumber} مساوی شد و کسی حذف نشد.`;
+  if (topId && !tied) {
+    const eliminated = state.players.find((p) => p.id === topId);
+    mafia.aliveIds = mafia.aliveIds.filter((id) => id !== topId);
+    outcomeText = `با ${topVotes} رأی، «${eliminated?.name}» از شهر خارج شد.`;
+  }
+  if (timedOut) {
+    outcomeText = `[پایان مهلت رأی‌گیری] ${outcomeText}`;
+  }
+
+  state.players = state.players.map((p) => ({
+    ...p,
+    status: mafia.aliveIds.includes(p.id) ? 'playing' : 'eliminated',
+  }));
+
+  mafia.log.unshift({ at: nowTimeLabel(), phase: 'VOTING', text: outcomeText });
+  const winner = checkAutoMafiaWinner(mafia);
+  let starsAwarded: number | null = null;
+
+  if (winner) {
+    mafia.winner = winner;
+    mafia.phase = 'GAME_OVER';
+    if (actorPlayer?.userId) {
+      const humanRole = mafia.roles[actorPlayer.id];
+      const humanWon =
+        (winner === 'citizens' && humanRole !== 'mafia') || (winner === 'mafia' && humanRole === 'mafia');
+      starsAwarded = awardMatchStarsOnce(
+        state,
+        actorPlayer.userId,
+        'mafia',
+        humanWon ? 260 : 100,
+        winner === 'citizens' ? 'پیروزی شهروندان در مافیا' : 'پیروزی مافیا',
+        humanWon
+      );
+    }
+  } else {
+    mafia.dayNumber += 1;
+    mafia.phase = 'NIGHT_ACTION';
+    mafia.votes = {};
+    mafia.phaseEndsAt = Date.now() + MAFIA_NIGHT_MS;
+    mafia.log.unshift({
+      at: nowTimeLabel(),
+      phase: 'NIGHT',
+      text: `شب ${mafia.dayNumber} آغاز شد.`,
+    });
+  }
+  return starsAwarded;
+}
+
+/**
+ * Server-authoritative timer reconciliation:
+ * Advances expired phases across Mafia, Truth or Dare, Quiz, and Hokm even if players disconnect.
+ */
+export function reconcileRoomTimers(state: EngineRoomState): boolean {
+  let changed = false;
+  const now = Date.now();
+
+  // 1. Mafia timers
+  if (state.gameType === 'mafia' && state.mafia) {
+    let guard = 0;
+    while (state.mafia.phase !== 'GAME_OVER' && now >= state.mafia.phaseEndsAt && guard < 3) {
+      guard++;
+      changed = true;
+      if (state.mafia.phase === 'NIGHT_ACTION') {
+        resolveMafiaNightInternal(state, null, undefined, true);
+      } else if (state.mafia.phase === 'DAY_DISCUSSION') {
+        state.mafia.phase = 'VOTING';
+        state.mafia.votes = {};
+        state.mafia.phaseEndsAt = now + MAFIA_VOTE_MS;
+        state.mafia.log.unshift({
+          at: nowTimeLabel(),
+          phase: 'VOTING',
+          text: `[پایان زمان بحث] رأی‌گیری روز ${state.mafia.dayNumber} آغاز شد.`,
+        });
+      } else if (state.mafia.phase === 'VOTING') {
+        resolveMafiaVoteInternal(state, null, undefined, true);
+      } else {
+        break;
+      }
+    }
+  }
+
+  // 2. Truth or Dare timers
+  if (state.gameType === 'truth_dare' && state.truthDare && state.truthDare.turnDeadline && now >= state.truthDare.turnDeadline) {
+    const td = state.truthDare;
+    if (td.phase === 'CHOOSE_MODE' || td.phase === 'SHOW_PROMPT') {
+      changed = true;
+      const targetPlayer = state.players.find((p) => p.id === td.targetPlayerId);
+      if (targetPlayer) {
+        td.history.unshift({
+          round: td.roundNumber,
+          playerName: targetPlayer.name,
+          mode: td.selectedMode === 'truth' ? 'حقیقت' : td.selectedMode === 'dare' ? 'جرئت' : 'رد نوبت',
+          outcome: 'skipped',
+          promptText: td.activePrompt?.text || 'مهلت انتخاب به پایان رسید و نوبت به نفر بعد منتقل شد.',
+        });
+      }
+      td.roundNumber += 1;
+      td.activePrompt = null;
+      td.selectedMode = null;
+      td.turnDeadline = null;
+      td.phase = td.roundNumber > td.maxRounds ? 'FINISHED' : 'READY_TO_SPIN';
+    }
+  }
+
+  // 3. Quiz timer
+  if (state.gameType === 'quiz' && state.quiz && state.quiz.phase === 'QUESTION' && state.quiz.currentQuestion) {
+    const deadline = state.quiz.questionStartedAt + state.quiz.questionDurationSec * 1000;
+    if (now >= deadline) {
+      changed = true;
+      state.quiz.streak = 0;
+      for (const r of state.quiz.rivals) {
+        if (crypto.randomInt(0, 100) < 68) {
+          r.score += 100 + crypto.randomInt(4, 15) * 10;
+        }
+      }
+      state.quiz.lastAnswer = {
+        selectedIndex: -1,
+        correctIndex: state.quiz.currentQuestion.correctIndex,
+        isCorrect: false,
+        pointsGained: 0,
+        streak: 0,
+      };
+      state.quiz.phase = 'REVEAL';
+    }
+  }
+
+  // 4. Hokm turn timeout
+  if (state.gameType === 'hokm' && state.hokm && state.hokm.phase === 'PLAYING' && state.hokmTurnDeadline && now >= state.hokmTurnDeadline) {
+    const autoCard = chooseBotCard(state.hokm, state.hokm.turn);
+    if (autoCard) {
+      changed = true;
+      let next = playCard(state.hokm, state.hokm.turn, autoCard.id);
+      next = advanceHokmBotsUntilHuman(next, state.players);
+      state.hokm = next;
+      state.hokmTurnDeadline = next.phase === 'PLAYING' ? now + HOKM_TURN_MS : null;
+    }
+  }
+
+  if (changed) {
+    const finished =
+      (state.gameType === 'mafia' && state.mafia?.phase === 'GAME_OVER') ||
+      (state.gameType === 'truth_dare' && state.truthDare?.phase === 'FINISHED') ||
+      (state.gameType === 'quiz' && state.quiz?.phase === 'FINISHED') ||
+      (state.gameType === 'hokm' && state.hokm?.phase === 'MATCH_OVER');
+    saveEngineRoom(state, finished ? 'finished' : 'playing');
+  }
+
+  return changed;
+}
+
 export function loadEngineRoom(roomCode: string): EngineRoomState | null {
   cleanupExpiredEngineRooms();
   const db = getDb();
@@ -421,7 +771,9 @@ export function loadEngineRoom(roomCode: string): EngineRoomState | null {
     | { state_json: string }
     | undefined;
   if (!row) return null;
-  return JSON.parse(row.state_json) as EngineRoomState;
+  const state = JSON.parse(row.state_json) as EngineRoomState;
+  reconcileRoomTimers(state);
+  return state;
 }
 
 export function saveEngineRoom(state: EngineRoomState, status: 'lobby' | 'playing' | 'finished' = 'playing') {
@@ -435,20 +787,44 @@ export function saveEngineRoom(state: EngineRoomState, status: 'lobby' | 'playin
 }
 
 /**
- * Security boundary: strips hidden hands, secret Mafia roles, and unrevealed Quiz answers
- * so no player can inspect API payloads to cheat.
+ * Security boundary: strictly strips other seats' hands, secret Mafia roles, detective intel,
+ * and unrevealed Quiz answers. NEVER falls back to player 0 for non-members.
  */
 export function sanitizeEngineStateForUser(state: EngineRoomState, viewerUserId: number | null) {
-  const viewerPlayer = viewerUserId ? state.players.find((p) => p.userId === viewerUserId) : null;
+  const viewerIndex = viewerUserId ? state.players.findIndex((p) => p.userId === viewerUserId && p.status !== 'left') : -1;
+  const viewerPlayer = viewerIndex >= 0 ? state.players[viewerIndex] : null;
+  const viewerSeat: Seat | null = viewerIndex >= 0 && viewerIndex <= 3 ? (viewerIndex as Seat) : null;
 
   const safeHokm = state.hokm
     ? {
         ...state.hokm,
+        mySeat: viewerSeat,
+        turnDeadline: state.hokmTurnDeadline ?? null,
         hands: {
-          0: state.hokm.phase === 'CHOOSE_HOKM' ? state.hokm.hands[0].slice(0, 5) : state.hokm.hands[0],
-          1: [],
-          2: [],
-          3: [],
+          0:
+            viewerSeat === 0
+              ? state.hokm.phase === 'CHOOSE_HOKM'
+                ? state.hokm.hands[0].slice(0, 5)
+                : state.hokm.hands[0]
+              : [],
+          1:
+            viewerSeat === 1
+              ? state.hokm.phase === 'CHOOSE_HOKM'
+                ? state.hokm.hands[1].slice(0, 5)
+                : state.hokm.hands[1]
+              : [],
+          2:
+            viewerSeat === 2
+              ? state.hokm.phase === 'CHOOSE_HOKM'
+                ? state.hokm.hands[2].slice(0, 5)
+                : state.hokm.hands[2]
+              : [],
+          3:
+            viewerSeat === 3
+              ? state.hokm.phase === 'CHOOSE_HOKM'
+                ? state.hokm.hands[3].slice(0, 5)
+                : state.hokm.hands[3]
+              : [],
         },
         handCounts: {
           0: state.hokm.hands[0].length,
@@ -470,11 +846,10 @@ export function sanitizeEngineStateForUser(state: EngineRoomState, viewerUserId:
         votes: state.mafia.votes,
         winner: state.mafia.winner,
         log: state.mafia.log,
-        myPlayerId: viewerPlayer?.id ?? state.players[0]?.id ?? null,
+        myPlayerId: viewerPlayer?.id ?? null,
         myRole: (() => {
-          const pid = viewerPlayer?.id ?? state.players[0]?.id;
-          if (!pid) return null;
-          const r = state.mafia.roles[pid];
+          if (!viewerPlayer) return null;
+          const r = state.mafia.roles[viewerPlayer.id];
           if (!r) return null;
           return {
             key: r,
@@ -483,11 +858,7 @@ export function sanitizeEngineStateForUser(state: EngineRoomState, viewerUserId:
             description: MAFIA_ROLE_META[r].description,
           };
         })(),
-        detectiveIntel: (() => {
-          const pid = viewerPlayer?.id ?? state.players[0]?.id;
-          return pid ? state.mafia.detectiveIntel[pid] || null : null;
-        })(),
-        // Reveal all roles ONLY after GAME_OVER
+        detectiveIntel: viewerPlayer ? state.mafia.detectiveIntel[viewerPlayer.id] || null : null,
         revealedRoles:
           state.mafia.phase === 'GAME_OVER'
             ? Object.fromEntries(
@@ -510,7 +881,6 @@ export function sanitizeEngineStateForUser(state: EngineRoomState, viewerUserId:
               question: state.quiz.currentQuestion.question,
               options: state.quiz.currentQuestion.options,
               difficulty: state.quiz.currentQuestion.difficulty,
-              // Never send correctIndex before answer is submitted!
               ...(state.quiz.phase === 'REVEAL' ? { correctIndex: state.quiz.currentQuestion.correctIndex } : {}),
             }
           : null,
@@ -522,6 +892,7 @@ export function sanitizeEngineStateForUser(state: EngineRoomState, viewerUserId:
     gameType: state.gameType,
     isHangout: state.isHangout,
     hostUserId: state.hostUserId,
+    serverNow: Date.now(),
     players: state.players,
     hokm: safeHokm,
     mafia: safeMafia,
@@ -534,9 +905,14 @@ export function sanitizeEngineStateForUser(state: EngineRoomState, viewerUserId:
 
 export function handleSwitchHangoutGame(
   state: EngineRoomState,
+  userId: number,
   nextGame: EngineGameType,
   category?: string
 ): EngineRoomState {
+  assertRoomMember(state, userId);
+  if (state.hostUserId !== userId) {
+    throw new GameEngineError('فقط میزبان اتاق می‌تواند بازی دورهمی را تغییر دهد.', 403);
+  }
   state.gameType = nextGame;
   state.isHangout = true;
   if (nextGame === 'hokm') {
@@ -553,7 +929,8 @@ export function handleSwitchHangoutGame(
         status: 'playing',
       });
     }
-    state.hokm = initHokmState(3);
+    state.hokm = initHokmState(state.players, 3);
+    state.hokmTurnDeadline = state.hokm.phase === 'PLAYING' ? Date.now() + HOKM_TURN_MS : null;
   } else if (nextGame === 'mafia') {
     while (state.players.length < 6) {
       const b = BOT_AVATARS[state.players.length % BOT_AVATARS.length];
@@ -570,7 +947,9 @@ export function handleSwitchHangoutGame(
     }
     state.mafia = initAutoMafiaState(state.players, 'classic');
   } else if (nextGame === 'truth_dare') {
-    state.truthDare = initTruthDareState(category || 'دوستانه');
+    const safeCat =
+      category === ADULT_TD_CATEGORY && !checkUserAdultVerified(userId) ? 'دوستانه' : category || 'دوستانه';
+    state.truthDare = initTruthDareState(safeCat);
   } else if (nextGame === 'quiz') {
     state.quiz = initQuizState(category || 'همه');
   }
@@ -578,41 +957,59 @@ export function handleSwitchHangoutGame(
   return state;
 }
 
-export function handleHokmChooseTrump(state: EngineRoomState, suit: Suit): EngineRoomState {
+export function handleHokmChooseTrump(state: EngineRoomState, userId: number, suit: Suit): EngineRoomState {
+  assertRoomMember(state, userId);
   if (!state.hokm || state.hokm.phase !== 'CHOOSE_HOKM') {
-    throw new Error('در حال حاضر مرحله انتخاب خال حکم نیست.');
+    throw new GameEngineError('در حال حاضر مرحله انتخاب خال حکم نیست.', 400);
   }
-  state.hokm = selectHokmSuit(state.hokm, suit);
+  const viewerIndex = state.players.findIndex((p) => p.userId === userId);
+  const hakemPlayer = state.players[state.hokm.hakem];
+  const isAuthorized = viewerIndex === state.hokm.hakem || (Boolean(hakemPlayer?.isBot) && state.hostUserId === userId);
+  if (!isAuthorized) {
+    throw new GameEngineError('فقط حاکم این دست می‌تواند خال حکم را انتخاب کند.', 403);
+  }
+  state.hokm = advanceHokmBotsUntilHuman(selectHokmSuit(state.hokm, suit), state.players);
+  state.hokmTurnDeadline = state.hokm.phase === 'PLAYING' ? Date.now() + HOKM_TURN_MS : null;
   saveEngineRoom(state, 'playing');
   return state;
 }
 
-export function handleHokmPlayCard(state: EngineRoomState, userId: number, cardId: string): { state: EngineRoomState; starsAwarded: number | null } {
+export function handleHokmPlayCard(
+  state: EngineRoomState,
+  userId: number,
+  cardId: string
+): { state: EngineRoomState; starsAwarded: number | null } {
+  assertRoomMember(state, userId);
   if (!state.hokm || state.hokm.phase !== 'PLAYING') {
-    throw new Error('بازی حکم در مرحله حرکت نیست.');
+    throw new GameEngineError('بازی حکم در مرحله حرکت نیست.', 400);
   }
-  if (state.hokm.turn !== 0) {
-    throw new Error('هنوز نوبت شما نرسیده است.');
+  const viewerIndex = state.players.findIndex((p) => p.userId === userId);
+  if (viewerIndex < 0 || viewerIndex > 3 || state.hokm.turn !== (viewerIndex as Seat)) {
+    throw new GameEngineError('هنوز نوبت شما نرسیده است.', 403);
   }
-  const beforeLen = state.hokm.hands[0].length;
-  let next = playCard(state.hokm, 0, cardId);
-  if (next.hands[0].length === beforeLen) {
-    throw new Error('این کارت طبق قوانین حکم (رعایت خال زمینه) در این نوبت مجاز نیست.');
+  const seat = viewerIndex as Seat;
+  const beforeLen = state.hokm.hands[seat].length;
+  let next = playCard(state.hokm, seat, cardId);
+  if (next.hands[seat].length === beforeLen) {
+    throw new GameEngineError('این کارت طبق قوانین حکم (رعایت خال زمینه) در این نوبت مجاز نیست.', 400);
   }
 
-  // Let bots auto-play their turns until it's seat 0's turn or hand/match ends
-  next = advanceHokmBotsUntilHuman(next);
+  next = advanceHokmBotsUntilHuman(next, state.players);
   state.hokm = next;
+  state.hokmTurnDeadline = next.phase === 'PLAYING' ? Date.now() + HOKM_TURN_MS : null;
 
   let starsAwarded: number | null = null;
   if (next.phase === 'MATCH_OVER') {
-    const won = next.matchScore[0] > next.matchScore[1];
+    const teamIdx = seat % 2;
+    const won = next.matchScore[teamIdx] > next.matchScore[1 - teamIdx];
     starsAwarded = awardMatchStarsOnce(
       state,
       userId,
       'hokm',
-      next.matchScore[0] * 120 + next.tricksWon[0] * 10,
-      won ? `پیروزی ${next.matchScore[0]} بر ${next.matchScore[1]} در حکم` : `پایان مسابقه حکم (${next.matchScore[0]}-${next.matchScore[1]})`,
+      next.matchScore[teamIdx] * 120 + next.tricksWon[teamIdx] * 10,
+      won
+        ? `پیروزی ${next.matchScore[teamIdx]} بر ${next.matchScore[1 - teamIdx]} در حکم`
+        : `پایان مسابقه حکم (${next.matchScore[teamIdx]}-${next.matchScore[1 - teamIdx]})`,
       won
     );
     saveEngineRoom(state, 'finished');
@@ -622,9 +1019,10 @@ export function handleHokmPlayCard(state: EngineRoomState, userId: number, cardI
   return { state, starsAwarded };
 }
 
-export function handleHokmNextHand(state: EngineRoomState): EngineRoomState {
+export function handleHokmNextHand(state: EngineRoomState, userId: number): EngineRoomState {
+  assertRoomMember(state, userId);
   if (!state.hokm || state.hokm.phase !== 'HAND_OVER') {
-    throw new Error('دست فعلی هنوز به پایان نرسیده است.');
+    throw new GameEngineError('دست فعلی هنوز به پایان نرسیده است.', 400);
   }
   const next = startNewHokmHand(
     state.hokm.hakem,
@@ -632,17 +1030,10 @@ export function handleHokmNextHand(state: EngineRoomState): EngineRoomState {
     state.hokm.roundNumber + 1,
     state.hokm.targetHands
   );
-  state.hokm = advanceHokmBotsUntilHuman(next);
+  state.hokm = advanceHokmBotsUntilHuman(next, state.players);
+  state.hokmTurnDeadline = state.hokm.phase === 'PLAYING' ? Date.now() + HOKM_TURN_MS : null;
   saveEngineRoom(state, 'playing');
   return state;
-}
-
-function checkAutoMafiaWinner(mafia: AutoMafiaState): 'citizens' | 'mafia' | null {
-  const aliveMafia = mafia.aliveIds.filter((id) => mafia.roles[id] === 'mafia').length;
-  const aliveCitizens = mafia.aliveIds.filter((id) => mafia.roles[id] !== 'mafia').length;
-  if (aliveMafia === 0) return 'citizens';
-  if (aliveMafia >= aliveCitizens) return 'mafia';
-  return null;
 }
 
 export function handleMafiaNightAction(
@@ -650,111 +1041,37 @@ export function handleMafiaNightAction(
   userId: number,
   targetId?: string
 ): { state: EngineRoomState; starsAwarded: number | null } {
+  const actor = assertRoomMember(state, userId);
   const mafia = state.mafia;
   if (!mafia || mafia.phase !== 'NIGHT_ACTION') {
-    throw new Error('بازی مافیا در فاز شب نیست.');
+    throw new GameEngineError('بازی مافیا در فاز شب نیست.', 400);
+  }
+  const isAlive = mafia.aliveIds.includes(actor.id);
+  if (!isAlive && state.hostUserId !== userId) {
+    throw new GameEngineError('بازیکن حذف‌شده نمی‌تواند در فاز شب اقدام ثبت کند.', 403);
   }
 
-  const human = state.players.find((p) => p.userId === userId) || state.players[0];
-  const humanRole = mafia.roles[human.id];
-  const aliveSet = new Set(mafia.aliveIds);
-  const aliveNonMafia = mafia.aliveIds.filter((id) => mafia.roles[id] !== 'mafia');
-
-  // 1. Determine Mafia shot (if human is alive mafia and picked target, use it; otherwise AI mafia picks)
-  let mafiaTarget: string | null = null;
-  if (aliveSet.has(human.id) && humanRole === 'mafia' && targetId && aliveSet.has(targetId)) {
-    mafiaTarget = targetId;
-  } else if (aliveNonMafia.length > 0) {
-    mafiaTarget = aliveNonMafia[crypto.randomInt(0, aliveNonMafia.length)];
-  }
-
-  // 2. Determine Doctor save
-  let doctorTarget: string | null = null;
-  const doctorId = mafia.aliveIds.find((id) => mafia.roles[id] === 'doctor');
-  if (doctorId) {
-    if (doctorId === human.id && targetId && aliveSet.has(targetId)) {
-      doctorTarget = targetId;
-    } else {
-      doctorTarget = mafia.aliveIds[crypto.randomInt(0, mafia.aliveIds.length)];
-    }
-  }
-
-  // 3. Determine Detective inquiry
-  const detectiveId = mafia.aliveIds.find((id) => mafia.roles[id] === 'detective');
-  if (detectiveId && detectiveId === human.id && targetId && aliveSet.has(targetId)) {
-    const targetPlayer = state.players.find((p) => p.id === targetId);
-    const isMafia = mafia.roles[targetId] === 'mafia';
-    mafia.detectiveIntel[human.id] = `استعلام کارآگاه از «${targetPlayer?.name}»: ${
-      isMafia ? 'تأیید شد — عضو تیم مافیا است!' : 'عضو تیم شهروندان است.'
-    }`;
-  }
-
-  // 4. Optional Sniper shot if human is sniper and selected a target
-  let sniperMsg = '';
-  if (aliveSet.has(human.id) && humanRole === 'sniper' && targetId && targetId !== human.id && aliveSet.has(targetId)) {
-    const targetPlayer = state.players.find((p) => p.id === targetId);
-    if (mafia.roles[targetId] === 'mafia') {
-      mafia.aliveIds = mafia.aliveIds.filter((id) => id !== targetId);
-      sniperMsg = ` تک‌تیرانداز با شلیک دقیق «${targetPlayer?.name}» (مافیا) را حذف کرد!`;
-    } else {
-      mafia.aliveIds = mafia.aliveIds.filter((id) => id !== human.id);
-      sniperMsg = ` تک‌تیرانداز به اشتباه شهروند را هدف گرفت و خودش از بازی خارج شد!`;
-    }
-  }
-
-  // 5. Resolve Mafia shot vs Doctor save
-  let summary = `صبح روز ${mafia.dayNumber}: شهر بدون کشته بیدار شد — دکتر هدف شب را نجات داد!`;
-  if (mafiaTarget && mafiaTarget !== doctorTarget && mafia.aliveIds.includes(mafiaTarget)) {
-    mafia.aliveIds = mafia.aliveIds.filter((id) => id !== mafiaTarget);
-    const victim = state.players.find((p) => p.id === mafiaTarget);
-    summary = `صبح روز ${mafia.dayNumber}: «${victim?.name}» در تاریکی شب از شهر حذف شد.`;
-  }
-  summary += sniperMsg;
-
-  state.players = state.players.map((p) => ({
-    ...p,
-    status: mafia.aliveIds.includes(p.id) ? 'playing' : 'eliminated',
-  }));
-
-  mafia.nightSummary = summary;
-  mafia.log.unshift({ at: nowTimeLabel(), phase: 'DAY', text: summary });
-
-  const winner = checkAutoMafiaWinner(mafia);
-  let starsAwarded: number | null = null;
-  if (winner) {
-    mafia.winner = winner;
-    mafia.phase = 'GAME_OVER';
-    const humanWon =
-      (winner === 'citizens' && humanRole !== 'mafia') || (winner === 'mafia' && humanRole === 'mafia');
-    starsAwarded = awardMatchStarsOnce(
-      state,
-      userId,
-      'mafia',
-      humanWon ? 260 : 100,
-      winner === 'citizens' ? 'پیروزی تیم شهروندان در مافیا' : 'پیروزی تیم مافیا',
-      humanWon
-    );
-    saveEngineRoom(state, 'finished');
-  } else {
-    mafia.phase = 'DAY_DISCUSSION';
-    mafia.phaseEndsAt = Date.now() + 60_000;
-    saveEngineRoom(state, 'playing');
-  }
-
+  const starsAwarded = resolveMafiaNightInternal(state, isAlive ? actor : null, isAlive ? targetId : undefined, false);
+  const nextStatus = (mafia.phase as string) === 'GAME_OVER' ? 'finished' : 'playing';
+  saveEngineRoom(state, nextStatus);
   return { state, starsAwarded };
 }
 
-export function handleMafiaStartVote(state: EngineRoomState): EngineRoomState {
+export function handleMafiaStartVote(state: EngineRoomState, userId: number): EngineRoomState {
+  const actor = assertRoomMember(state, userId);
   if (!state.mafia || state.mafia.phase !== 'DAY_DISCUSSION') {
-    throw new Error('فاز گفت‌وگوی روز فعال نیست.');
+    throw new GameEngineError('فاز گفت‌وگوی روز فعال نیست.', 400);
+  }
+  if (!state.mafia.aliveIds.includes(actor.id) && state.hostUserId !== userId) {
+    throw new GameEngineError('فقط بازیکنان زنده یا میزبان می‌توانند رأی‌گیری را آغاز کنند.', 403);
   }
   state.mafia.phase = 'VOTING';
   state.mafia.votes = {};
-  state.mafia.phaseEndsAt = Date.now() + 35_000;
+  state.mafia.phaseEndsAt = Date.now() + MAFIA_VOTE_MS;
   state.mafia.log.unshift({
     at: nowTimeLabel(),
     phase: 'VOTING',
-    text: `رأی‌گیری خودکار روز ${state.mafia.dayNumber} آغاز شد.`,
+    text: `رأی‌گیری روز ${state.mafia.dayNumber} آغاز شد.`,
   });
   saveEngineRoom(state, 'playing');
   return state;
@@ -765,106 +1082,49 @@ export function handleMafiaVote(
   userId: number,
   targetId: string
 ): { state: EngineRoomState; starsAwarded: number | null } {
+  const actor = assertRoomMember(state, userId);
   const mafia = state.mafia;
   if (!mafia || mafia.phase !== 'VOTING') {
-    throw new Error('فاز رأی‌گیری مافیا فعال نیست.');
+    throw new GameEngineError('فاز رأی‌گیری مافیا فعال نیست.', 400);
   }
-  const human = state.players.find((p) => p.userId === userId) || state.players[0];
-  if (mafia.aliveIds.includes(human.id) && mafia.aliveIds.includes(targetId)) {
-    mafia.votes[human.id] = targetId;
+  const isAlive = mafia.aliveIds.includes(actor.id);
+  if (!isAlive && state.hostUserId !== userId) {
+    throw new GameEngineError('بازیکن حذف‌شده حق رأی ندارد.', 403);
   }
-
-  // Bots automatically cast intelligent votes
-  for (const pid of mafia.aliveIds) {
-    if (pid === human.id) continue;
-    const role = mafia.roles[pid];
-    const candidates = mafia.aliveIds.filter((cid) => cid !== pid && (role === 'mafia' ? mafia.roles[cid] !== 'mafia' : true));
-    if (candidates.length > 0) {
-      mafia.votes[pid] = candidates[crypto.randomInt(0, candidates.length)];
-    }
+  if (isAlive && !mafia.aliveIds.includes(targetId)) {
+    throw new GameEngineError('هدف انتخاب‌شده در بازی زنده نیست.', 400);
   }
 
-  // Tally votes
-  const tally = new Map<string, number>();
-  for (const votedId of Object.values(mafia.votes)) {
-    tally.set(votedId, (tally.get(votedId) ?? 0) + 1);
-  }
-  let topId: string | null = null;
-  let topVotes = 0;
-  let tied = false;
-  for (const [cid, count] of tally.entries()) {
-    if (count > topVotes) {
-      topId = cid;
-      topVotes = count;
-      tied = false;
-    } else if (count === topVotes) {
-      tied = true;
-    }
-  }
-
-  let outcomeText = `در رأی‌گیری روز ${mafia.dayNumber} آرا برابر شد و هیچ‌کس از شهر خارج نشد.`;
-  if (topId && !tied) {
-    const eliminated = state.players.find((p) => p.id === topId);
-    mafia.aliveIds = mafia.aliveIds.filter((id) => id !== topId);
-    outcomeText = `با ${topVotes} رأی، «${eliminated?.name}» از شهر خارج شد.`;
-  }
-
-  state.players = state.players.map((p) => ({
-    ...p,
-    status: mafia.aliveIds.includes(p.id) ? 'playing' : 'eliminated',
-  }));
-
-  mafia.log.unshift({ at: nowTimeLabel(), phase: 'VOTING', text: outcomeText });
-  const winner = checkAutoMafiaWinner(mafia);
-  let starsAwarded: number | null = null;
-
-  if (winner) {
-    mafia.winner = winner;
-    mafia.phase = 'GAME_OVER';
-    const humanRole = mafia.roles[human.id];
-    const humanWon =
-      (winner === 'citizens' && humanRole !== 'mafia') || (winner === 'mafia' && humanRole === 'mafia');
-    starsAwarded = awardMatchStarsOnce(
-      state,
-      userId,
-      'mafia',
-      humanWon ? 260 : 100,
-      winner === 'citizens' ? 'پیروزی شهروندان در مافیا' : 'پیروزی مافیا',
-      humanWon
-    );
-    saveEngineRoom(state, 'finished');
-  } else {
-    mafia.dayNumber += 1;
-    mafia.phase = 'NIGHT_ACTION';
-    mafia.votes = {};
-    mafia.phaseEndsAt = Date.now() + 45_000;
-    mafia.log.unshift({
-      at: nowTimeLabel(),
-      phase: 'NIGHT',
-      text: `شب ${mafia.dayNumber} آغاز شد. نقش‌های شب حرکت خود را ثبت کنند.`,
-    });
-    saveEngineRoom(state, 'playing');
-  }
-
+  const starsAwarded = resolveMafiaVoteInternal(state, isAlive ? actor : null, isAlive ? targetId : undefined, false);
+  const nextStatus = (mafia.phase as string) === 'GAME_OVER' ? 'finished' : 'playing';
+  saveEngineRoom(state, nextStatus);
   return { state, starsAwarded };
 }
 
-export function handleTruthDareSpin(state: EngineRoomState, category?: string): EngineRoomState {
+export function handleTruthDareSpin(state: EngineRoomState, userId: number, category?: string): EngineRoomState {
+  assertRoomMember(state, userId);
   const td = state.truthDare;
-  if (!td) throw new Error('وضعیت اتاق جرئت و حقیقت یافت نشد.');
-  if (category) td.category = category;
+  if (!td) throw new GameEngineError('وضعیت اتاق جرئت و حقیقت یافت نشد.', 400);
+  if (td.phase !== 'READY_TO_SPIN' && td.phase !== 'LOBBY') {
+    throw new GameEngineError('در این مرحله ابتدا باید نوبت فعلی تکمیل شود.', 400);
+  }
+
+  if (category) {
+    if (category === ADULT_TD_CATEGORY && !checkUserAdultVerified(userId)) {
+      throw new GameEngineError('بخش بزرگسالان ۱۸+ فقط پس از تکمیل احراز سن و رضایت در پروفایل باز می‌شود.', 403);
+    }
+    td.category = category;
+  }
 
   const activePlayers = state.players.filter((p) => p.status !== 'left');
   if (activePlayers.length < 2) {
-    throw new Error('برای چرخاندن بطری حداقل ۲ بازیکن لازم است.');
+    throw new GameEngineError('برای چرخاندن بطری حداقل ۲ بازیکن لازم است.', 400);
   }
 
-  // Cryptographically authoritative random player selection on Backend
   const chosenIdx = crypto.randomInt(0, activePlayers.length);
   const chosenPlayer = activePlayers[chosenIdx];
   const seatAngleDeg = (360 / activePlayers.length) * chosenIdx;
   const extraFullSpins = (4 + crypto.randomInt(0, 4)) * 360;
-  // Accumulate monotonically so the 3D bottle always spins forward naturally
   const currentBase = Math.floor(td.targetAngleDeg / 360) * 360;
   const targetAngleDeg = currentBase + extraFullSpins + seatAngleDeg;
 
@@ -876,7 +1136,7 @@ export function handleTruthDareSpin(state: EngineRoomState, category?: string): 
   td.selectedMode = null;
   td.activePrompt = null;
   td.phase = 'CHOOSE_MODE';
-  td.turnDeadline = Date.now() + 45_000;
+  td.turnDeadline = Date.now() + TD_CHOOSE_MS;
 
   saveEngineRoom(state, 'playing');
   return state;
@@ -888,34 +1148,57 @@ export function handleTruthDareChooseMode(
   mode: 'truth' | 'dare',
   category?: string
 ): EngineRoomState {
+  assertRoomMember(state, userId);
   const td = state.truthDare;
-  if (!td) throw new Error('اتاق جرئت و حقیقت فعال نیست.');
-  const cat = category || td.category || 'همه';
-  td.category = cat;
-
-  const isAdultVerified = checkUserAdultVerified(userId);
-  if (cat === 'بزرگسالان ۱۸+' && !isAdultVerified) {
-    throw new Error('حالت بزرگسالان ۱۸+ فقط پس از تکمیل احراز چندلایه سن و رضایت در بخش پروفایل باز می‌شود.');
+  if (!td || td.phase !== 'CHOOSE_MODE') {
+    throw new GameEngineError('ابتدا باید بطری بچرخد تا بازیکن انتخاب شود.', 400);
   }
 
-  const db = getDb();
-  let rows = db
-    .prepare(
-      isAdultVerified
-        ? 'SELECT id, mode, category, text, is_adult FROM truth_dare_prompts WHERE mode = ?'
-        : 'SELECT id, mode, category, text, is_adult FROM truth_dare_prompts WHERE mode = ? AND is_adult = 0'
-    )
-    .all(mode) as { id: number; mode: 'truth' | 'dare'; category: string; text: string; is_adult: number }[];
+  const targetPlayer = state.players.find((p) => p.id === td.targetPlayerId);
+  if (!targetPlayer) {
+    throw new GameEngineError('بازیکن نوبت فعلی یافت نشد.', 400);
+  }
+  const canAct = targetPlayer.userId === userId || (targetPlayer.isBot && state.hostUserId === userId);
+  if (!canAct) {
+    throw new GameEngineError(`الان نوبت «${targetPlayer.name}» است و فقط او می‌تواند حقیقت یا جرئت را انتخاب کند.`, 403);
+  }
 
-  if (cat !== 'همه') {
-    const filtered = rows.filter((r) => r.category === cat);
-    if (filtered.length > 0) rows = filtered;
+  const cat = category || td.category || 'همه';
+  const isAdultVerified = checkUserAdultVerified(userId);
+  if (cat === ADULT_TD_CATEGORY && !isAdultVerified) {
+    throw new GameEngineError('دسته بزرگسالان ۱۸+ قفل است و نیاز به احراز چندلایه ۱۸+ در پروفایل دارد.', 403);
+  }
+  td.category = cat;
+
+  const db = getDb();
+  let rows: { id: number; mode: 'truth' | 'dare'; category: string; text: string; is_adult: number }[];
+
+  // STRICT truth vs dare separation + strict adult isolation
+  if (cat === ADULT_TD_CATEGORY) {
+    rows = db
+      .prepare('SELECT id, mode, category, text, is_adult FROM truth_dare_prompts WHERE mode = ? AND category = ? AND is_adult = 1')
+      .all(mode, ADULT_TD_CATEGORY) as typeof rows;
+  } else if (cat !== 'همه') {
+    rows = db
+      .prepare('SELECT id, mode, category, text, is_adult FROM truth_dare_prompts WHERE mode = ? AND category = ? AND is_adult = 0')
+      .all(mode, cat) as typeof rows;
+  } else {
+    rows = db
+      .prepare('SELECT id, mode, category, text, is_adult FROM truth_dare_prompts WHERE mode = ? AND is_adult = 0')
+      .all(mode) as typeof rows;
+  }
+
+  // Fallback ONLY within same mode and strictly safe (is_adult = 0) if a custom category has 0 rows
+  if (rows.length === 0 && cat !== ADULT_TD_CATEGORY) {
+    rows = db
+      .prepare('SELECT id, mode, category, text, is_adult FROM truth_dare_prompts WHERE mode = ? AND is_adult = 0')
+      .all(mode) as typeof rows;
   }
 
   const unused = rows.filter((r) => !td.usedPromptIds.includes(r.id));
   const pool = unused.length > 0 ? unused : rows;
   if (pool.length === 0) {
-    throw new Error('سؤال یا چالشی در این دسته‌بندی موجود نیست.');
+    throw new GameEngineError('موردی برای این حالت یافت نشد.', 404);
   }
 
   const picked = pool[crypto.randomInt(0, pool.length)];
@@ -931,7 +1214,7 @@ export function handleTruthDareChooseMode(
     td.usedPromptIds.push(picked.id);
   }
   td.phase = 'SHOW_PROMPT';
-  td.turnDeadline = Date.now() + 60_000;
+  td.turnDeadline = Date.now() + TD_PROMPT_MS;
 
   saveEngineRoom(state, 'playing');
   return state;
@@ -942,10 +1225,21 @@ export function handleTruthDareResolveTurn(
   userId: number,
   outcome: 'completed' | 'skipped'
 ): { state: EngineRoomState; starsAwarded: number | null } {
+  assertRoomMember(state, userId);
   const td = state.truthDare;
-  if (!td) throw new Error('اتاق جرئت و حقیقت یافت نشد.');
+  if (!td || td.phase !== 'SHOW_PROMPT') {
+    throw new GameEngineError('در این مرحله کارتی برای ثبت نتیجه فعال نیست.', 400);
+  }
 
   const targetPlayer = state.players.find((p) => p.id === td.targetPlayerId);
+  if (targetPlayer) {
+    const canResolve =
+      targetPlayer.userId === userId || (targetPlayer.isBot && state.hostUserId === userId) || state.hostUserId === userId;
+    if (!canResolve) {
+      throw new GameEngineError('فقط بازیکن نوبت فعلی یا میزبان می‌تواند نتیجه این نوبت را ثبت کند.', 403);
+    }
+  }
+
   if (outcome === 'completed' && targetPlayer) {
     targetPlayer.score += 30;
   }
@@ -973,13 +1267,12 @@ export function handleTruthDareResolveTurn(
       userId,
       'truth_dare',
       Math.max(60, myScore),
-      `تکمیل ${td.maxRounds} دور جرئت و حقیقت دورهمی`,
+      `تکمیل ${td.maxRounds} دور جرئت و حقیقت`,
       true
     );
     saveEngineRoom(state, 'finished');
   } else {
     td.phase = 'READY_TO_SPIN';
-    // Also reward partial stars after 3 completed turns if not yet claimed
     const completedCount = td.history.filter((h) => h.outcome === 'completed').length;
     if (completedCount === 3) {
       starsAwarded = awardMatchStarsOnce(state, userId, 'truth_dare', 120, 'تکمیل ۳ چالش جرئت و حقیقت', true);
@@ -995,9 +1288,10 @@ export function handleQuizAnswer(
   userId: number,
   selectedIndex: number
 ): { state: EngineRoomState; starsAwarded: number | null } {
+  const me = assertRoomMember(state, userId);
   const qz = state.quiz;
   if (!qz || qz.phase !== 'QUESTION' || !qz.currentQuestion) {
-    throw new Error('سؤال فعالی برای پاسخ‌گویی وجود ندارد.');
+    throw new GameEngineError('سؤال فعالی برای پاسخ‌گویی وجود ندارد.', 400);
   }
 
   const elapsedSec = Math.max(0, (Date.now() - qz.questionStartedAt) / 1000);
@@ -1009,16 +1303,13 @@ export function handleQuizAnswer(
     qz.streak += 1;
     qz.correctCount += 1;
     pointsGained = 100 + remainingSec * 12 + (qz.streak > 1 ? 25 : 0);
-    const me = state.players.find((p) => p.userId === userId) || state.players[0];
-    if (me) me.score += pointsGained;
+    me.score += pointsGained;
   } else {
     qz.streak = 0;
   }
 
-  // Update simulated live rivals
   for (const r of qz.rivals) {
-    const rivalGotRight = crypto.randomInt(0, 100) < 68;
-    if (rivalGotRight) {
+    if (crypto.randomInt(0, 100) < 68) {
       r.score += 100 + crypto.randomInt(4, 15) * 10;
     }
   }
@@ -1039,15 +1330,17 @@ export function handleQuizNext(
   state: EngineRoomState,
   userId: number
 ): { state: EngineRoomState; starsAwarded: number | null } {
+  const me = assertRoomMember(state, userId);
   const qz = state.quiz;
-  if (!qz) throw new Error('اتاق کوییز فعال نیست.');
+  if (!qz || qz.phase !== 'REVEAL') {
+    throw new GameEngineError('ابتدا باید به سؤال فعلی پاسخ دهید.', 400);
+  }
 
   const nextIdx = qz.currentIndex + 1;
   if (nextIdx >= qz.questionIds.length) {
     qz.phase = 'FINISHED';
     qz.currentQuestion = null;
-    const me = state.players.find((p) => p.userId === userId) || state.players[0];
-    const myScore = me?.score ?? 0;
+    const myScore = me.score;
     const topRival = Math.max(...qz.rivals.map((r) => r.score), 0);
     const won = myScore >= topRival && qz.correctCount >= 3;
     const starsAwarded = awardMatchStarsOnce(
@@ -1055,7 +1348,7 @@ export function handleQuizNext(
       userId,
       'quiz',
       myScore,
-      `پاسخ صحیح ${qz.correctCount} از ${qz.totalQuestions} در لیگ عطارد`,
+      `پاسخ صحیح ${qz.correctCount} از ${qz.totalQuestions} در کوییز`,
       won
     );
     saveEngineRoom(state, 'finished');

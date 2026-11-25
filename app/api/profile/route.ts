@@ -152,11 +152,12 @@ export async function PATCH(req: NextRequest) {
     const current = db.prepare('SELECT * FROM user_profiles WHERE user_id = ?').get(auth.id) as Record<string, unknown>;
     const nextBirthDate = d.birthDate ?? (current.birth_date as string | null);
     const computedAge = calculateAge(nextBirthDate);
-    // Automatically disable dating for under-18 users
-    const safeDatingEnabled = computedAge !== null && computedAge < 18 ? 0 : d.datingEnabled !== undefined ? (d.datingEnabled ? 1 : 0) : Number(current.dating_enabled);
+    const isEligibleAdult = computedAge !== null && computedAge >= 18;
+    const safeDatingEnabled = !isEligibleAdult ? 0 : d.datingEnabled !== undefined ? (d.datingEnabled ? 1 : 0) : Number(current.dating_enabled);
 
-    if (computedAge !== null && computedAge < 18) {
+    if (!isEligibleAdult) {
       db.prepare("UPDATE dating_profiles SET is_active = 0, updated_at = datetime('now') WHERE user_id = ?").run(auth.id);
+      db.prepare("UPDATE blind_dates SET status = 'ended', updated_at = datetime('now') WHERE (user_a_id = ? OR user_b_id = ?) AND status != 'ended'").run(auth.id, auth.id);
     }
 
     db.prepare(`

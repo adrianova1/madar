@@ -82,11 +82,11 @@ export async function GET(req: NextRequest) {
     | undefined;
 
   const myAge = calculateAge(me?.birth_date);
-  if (myAge !== null && myAge < 18) {
+  if (myAge === null || myAge < 18) {
     return NextResponse.json({
       ageRestricted: true,
       datingProfileRequired: false,
-      error: 'بخش آشنایی ونوس فقط برای کاربران ۱۸ سال به بالا در دسترس است.',
+      error: 'برای دسترسی به بخش آشنایی ونوس ثبت تاریخ تولد معتبر و سن حداقل ۱۸ سال الزامی است.',
       candidates: [],
       matches: [],
       favorites: [],
@@ -178,7 +178,8 @@ export async function GET(req: NextRequest) {
   const candidates = [];
   for (const c of rawCandidates) {
     const cAge = calculateAge(c.birth_date as string | null);
-    if (cAge !== null && cAge < 18) continue;
+    if (cAge === null || cAge < 18) continue;
+    if (cAge < myDatingProfile.min_age || cAge > myDatingProfile.max_age) continue;
     if (cityFilter && String(c.city) !== cityFilter) continue;
 
     const cInterests = JSON.parse(String(c.interests || '[]')) as string[];
@@ -303,8 +304,8 @@ export async function POST(req: NextRequest) {
     | { birth_date: string | null }
     | undefined;
   const age = calculateAge(me?.birth_date);
-  if (age !== null && age < 18) {
-    return NextResponse.json({ error: 'دسترسی به بخش آشنایی ونوس برای کاربران زیر ۱۸ سال مجاز نیست.' }, { status: 403 });
+  if (age === null || age < 18) {
+    return NextResponse.json({ error: 'دسترسی به بخش آشنایی ونوس فقط با تاریخ تولد معتبر بالای ۱۸ سال مجاز است.' }, { status: 403 });
   }
 
   if (data.type === 'like' || data.type === 'superlike' || data.type === 'pass' || data.type === 'favorite' || data.type === 'intro') {

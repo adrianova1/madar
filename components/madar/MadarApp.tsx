@@ -2,7 +2,20 @@
 
 import React, { useCallback, useEffect, useState } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
-import { Compass, Gamepad2, Heart, Mail, Sparkles, Star, User, Volume2, VolumeX } from 'lucide-react';
+import {
+  Compass,
+  ExternalLink,
+  Gamepad2,
+  Heart,
+  Mail,
+  RefreshCw,
+  Send,
+  Sparkles,
+  Star,
+  User,
+  Volume2,
+  VolumeX,
+} from 'lucide-react';
 import { getTelegramWebApp, initTelegramMiniApp, triggerHaptic } from '@/lib/telegram-webapp';
 import { madarSound } from './SoundFX';
 import GalaxyHub from './GalaxyHub';
@@ -56,10 +69,11 @@ export default function MadarApp() {
   const [botUsername, setBotUsername] = useState('MadarBot');
 
   const [view, setView] = useState<MainView>('home');
-  const [gameSubTab, setGameSubTab] = useState<GameSubTab>('hokm');
+  const [gameSubTab, setGameSubTab] = useState<GameSubTab | null>(null);
   const [liteMode, setLiteMode] = useState(false);
-  const [soundEnabled, setSoundEnabled] = useState(false); // Muted at start per confirmed choice
+  const [soundEnabled, setSoundEnabled] = useState(false); // Muted at start per user preference
   const [booting, setBooting] = useState(true);
+  const [authError, setAuthError] = useState<string | null>(null);
 
   const fetchSessionBundle = useCallback(async (activeToken: string | null) => {
     const res = await fetch('/api/auth/session', {
@@ -89,15 +103,37 @@ export default function MadarApp() {
     }
   }, []);
 
-  // Bootstrap hardware detection + Telegram Mini App SDK + deep-link tab + initial session
+  const authenticateViaTelegram = useCallback(async () => {
+    setAuthError(null);
+    const tg = initTelegramMiniApp();
+    if (tg.inTelegram && tg.initData) {
+      const res = await fetch('/api/auth/session', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode: 'telegram', initData: tg.initData }),
+      });
+      const data = await res.json();
+      if (res.ok && data.token) {
+        setToken(data.token);
+        setCurrentSessionId(data.currentSessionId);
+        await fetchSessionBundle(data.token);
+        return true;
+      }
+      setAuthError(data.error || 'تأیید امضای تلگرام ناموفق بود.');
+      await fetchSessionBundle(null);
+      return false;
+    }
+    await fetchSessionBundle(null);
+    return false;
+  }, [fetchSessionBundle]);
+
+  // Bootstrap: real Telegram Mini App auth ONLY (zero demo_enter auto-login!)
   useEffect(() => {
     let active = true;
     async function boot() {
       if (shouldDefaultToLiteMode()) {
         setLiteMode(true);
       }
-
-      const tg = initTelegramMiniApp();
 
       if (typeof window !== 'undefined') {
         const tabParam = new URLSearchParams(window.location.search).get('tab');
@@ -114,43 +150,15 @@ export default function MadarApp() {
         }
       }
 
-      if (tg.inTelegram && tg.initData) {
-        const res = await fetch('/api/auth/session', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ mode: 'telegram', initData: tg.initData }),
-        });
-        if (res.ok && active) {
-          const data = await res.json();
-          setToken(data.token);
-          setCurrentSessionId(data.currentSessionId);
-          await fetchSessionBundle(data.token);
-          setBooting(false);
-          return;
-        }
-      }
-
-      const demoRes = await fetch('/api/auth/session', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ mode: 'demo_enter' }),
-      });
-      if (demoRes.ok && active) {
-        const data = await demoRes.json();
-        setToken(data.token);
-        setCurrentSessionId(data.currentSessionId);
-        await fetchSessionBundle(data.token);
-      } else if (active) {
-        await fetchSessionBundle(null);
-      }
+      await authenticateViaTelegram();
       if (active) setBooting(false);
     }
 
-    boot();
+    void boot();
     return () => {
       active = false;
     };
-  }, [fetchSessionBundle]);
+  }, [authenticateViaTelegram]);
 
   // Telegram Mini App BackButton synchronization
   useEffect(() => {
@@ -170,7 +178,9 @@ export default function MadarApp() {
 
   function handleNavigate(nextView: MainView, nextGameTab?: GameSubTab) {
     triggerHaptic('light');
-    if (nextGameTab) setGameSubTab(nextGameTab);
+    if (nextView === 'games') {
+      setGameSubTab(nextGameTab ?? null);
+    }
     setView(nextView);
     if (typeof window !== 'undefined') {
       window.scrollTo({ top: 0, behavior: 'smooth' });
@@ -223,28 +233,77 @@ export default function MadarApp() {
 
   const navItems: { id: MainView; label: string; icon: React.ComponentType<{ className?: string }> }[] = [
     { id: 'home', label: 'خانه', icon: Compass },
-    { id: 'venus', label: 'ونوس', icon: Heart },
     { id: 'games', label: 'بازی‌ها', icon: Gamepad2 },
+    { id: 'venus', label: 'ونوس', icon: Heart },
     { id: 'whisper', label: 'نجوا', icon: Mail },
     { id: 'profile', label: 'پروفایل', icon: User },
   ];
 
+  // Direct Telegram Mini App Entry Gate when opened outside Telegram without an authenticated session
+  if (!booting && !user) {
+    return (
+      <div className="min-h-[100dvh] bg-[#0e1621] text-slate-100 flex items-center justify-center p-4">
+        <div className="w-full max-w-md madar-glass rounded-3xl p-6 sm:p-8 space-y-6 text-center">
+          <div className="w-16 h-16 rounded-2xl bg-[#38bdf8]/15 border border-[#38bdf8]/35 mx-auto flex items-center justify-center">
+            <Send className="w-7 h-7 text-[#38bdf8]" />
+          </div>
+
+          <div className="space-y-2">
+            <h1 className="text-2xl font-bold text-white">مدار | MADAR</h1>
+            <p className="text-sm text-slate-300 leading-relaxed">
+              برای حفظ امنیت هویت و جلوگیری از ورود آزمایشی، ورود به مدار منحصراً از طریق Telegram Mini App انجام می‌شود.
+            </p>
+          </div>
+
+          {authError && (
+            <div className="rounded-xl border border-rose-500/35 bg-rose-500/10 px-4 py-3 text-xs text-rose-200">
+              {authError}
+            </div>
+          )}
+
+          <div className="space-y-2.5">
+            <a
+              href={`https://t.me/${botUsername}`}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="w-full inline-flex items-center justify-center gap-2 rounded-xl bg-[#38bdf8] px-5 py-3.5 text-sm font-bold text-slate-950 hover:brightness-110 transition-all min-h-[48px]"
+            >
+              <ExternalLink className="w-4 h-4 shrink-0" />
+              <span>باز کردن در تلگرام (@{botUsername})</span>
+            </a>
+
+            <button
+              type="button"
+              onClick={() => void authenticateViaTelegram()}
+              className="w-full inline-flex items-center justify-center gap-2 rounded-xl border border-[#23303e] bg-[#0e1621] px-4 py-3 text-xs font-semibold text-slate-200 hover:border-[#38bdf8]/50 transition-colors min-h-[44px]"
+            >
+              <RefreshCw className="w-3.5 h-3.5 shrink-0" />
+              <span>تلاش مجدد برای اتصال به تلگرام</span>
+            </button>
+          </div>
+
+          <p className="text-[11px] text-slate-500">
+            احراز هویت واقعی با امضای رمزنگاری‌شده Telegram initData
+          </p>
+        </div>
+      </div>
+    );
+  }
+
   return (
-    <div className="min-h-[100dvh] bg-[#050816] text-slate-100 flex flex-col">
-      {/* Strict 3-Zone Cosmic Top Bar (<= 56px height) */}
-      <header className="sticky top-0 z-30 h-14 border-b border-indigo-500/20 bg-[#050816]/95 pt-safe">
-        <div className="max-w-7xl mx-auto h-full px-3.5 sm:px-6 flex items-center justify-between gap-4">
-          {/* Zone 1: Brand Wordmark */}
+    <div className="min-h-[100dvh] bg-[#0e1621] text-slate-100 flex flex-col">
+      {/* Minimal Telegram-Native Top Bar (52px height) */}
+      <header className="sticky top-0 z-30 h-[52px] border-b border-[#23303e] bg-[#17212b]/95 pt-safe">
+        <div className="max-w-5xl mx-auto h-full px-3.5 sm:px-5 flex items-center justify-between gap-3">
           <button
             type="button"
             onClick={() => handleNavigate('home')}
-            className="text-lg font-bold tracking-tight text-white whitespace-nowrap shrink-0 cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400 rounded-md px-1"
+            className="text-base font-bold tracking-tight text-white whitespace-nowrap shrink-0 cursor-pointer"
           >
             مدار
           </button>
 
-          {/* Zone 2: 5 Single-Line Desktop Nav Links */}
-          <nav className="hidden md:flex items-center gap-7 text-sm font-medium">
+          <nav className="hidden md:flex items-center gap-6 text-sm font-medium">
             {navItems.map((item) => {
               const active = view === item.id;
               return (
@@ -253,29 +312,28 @@ export default function MadarApp() {
                   type="button"
                   onClick={() => handleNavigate(item.id)}
                   className={`relative py-1 transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
-                    active ? 'text-white font-semibold' : 'text-slate-400 hover:text-slate-100'
+                    active ? 'text-[#38bdf8] font-semibold' : 'text-slate-400 hover:text-slate-100'
                   }`}
                 >
                   {item.label}
                   {active && (
-                    <span className="absolute -bottom-[17px] left-0 right-0 h-0.5 bg-gradient-to-l from-cyan-400 to-purple-400 rounded-full" />
+                    <span className="absolute -bottom-[15px] left-0 right-0 h-0.5 bg-[#38bdf8] rounded-full" />
                   )}
                 </button>
               );
             })}
           </nav>
 
-          {/* Zone 3: Sound + Lite Mode Icon Toggles + Star Wallet / Sign In */}
-          <div className="flex items-center gap-2 shrink-0">
+          <div className="flex items-center gap-1.5 shrink-0">
             <button
               type="button"
               onClick={handleToggleSound}
-              title={soundEnabled ? 'قطع افکت‌های صوتی' : 'فعال‌سازی افکت‌های صوتی'}
+              title={soundEnabled ? 'قطع صدا' : 'روشن کردن صدا'}
               aria-label={soundEnabled ? 'قطع صدا' : 'روشن کردن صدا'}
               className={`w-9 h-9 rounded-xl border flex items-center justify-center transition-colors shrink-0 ${
                 soundEnabled
-                  ? 'border-cyan-400/50 bg-cyan-400/15 text-cyan-200'
-                  : 'border-indigo-500/25 bg-[#0a1026] text-slate-400 hover:text-white'
+                  ? 'border-[#38bdf8]/45 bg-[#38bdf8]/15 text-[#38bdf8]'
+                  : 'border-[#23303e] bg-[#0e1621] text-slate-400 hover:text-white'
               }`}
             >
               {soundEnabled ? <Volume2 className="w-4 h-4" /> : <VolumeX className="w-4 h-4" />}
@@ -284,33 +342,25 @@ export default function MadarApp() {
             <button
               type="button"
               onClick={() => setLiteMode((v) => !v)}
-              title={liteMode ? 'حالت سبک فعال است (کلیک برای سه‌بعدی)' : 'گرافیک سه‌بعدی فعال است (کلیک برای حالت سبک)'}
-              aria-label="تغییر حالت سه‌بعدی و سبک"
+              title={liteMode ? 'حالت سبک فعال است' : 'حالت سه‌بعدی فعال است'}
+              aria-label="تغییر حالت گرافیک"
               className={`w-9 h-9 rounded-xl border flex items-center justify-center transition-colors shrink-0 ${
                 !liteMode
-                  ? 'border-purple-400/50 bg-purple-500/15 text-purple-200'
-                  : 'border-indigo-500/25 bg-[#0a1026] text-slate-400 hover:text-white'
+                  ? 'border-[#8b5cf6]/45 bg-[#8b5cf6]/15 text-purple-200'
+                  : 'border-[#23303e] bg-[#0e1621] text-slate-400 hover:text-white'
               }`}
             >
               <Sparkles className="w-4 h-4" />
             </button>
 
-            {user ? (
+            {user && (
               <button
                 type="button"
                 onClick={() => handleNavigate('shop')}
-                className="inline-flex items-center gap-1.5 rounded-xl bg-amber-400/15 border border-amber-400/45 px-3 py-1.5 text-xs font-semibold text-amber-200 hover:bg-amber-400 hover:text-slate-950 transition-colors whitespace-nowrap shrink-0 min-h-[36px]"
+                className="inline-flex items-center gap-1.5 rounded-xl bg-amber-400/12 border border-amber-400/35 px-2.5 py-1.5 text-xs font-semibold text-amber-300 hover:bg-amber-400 hover:text-slate-950 transition-colors whitespace-nowrap shrink-0 min-h-[36px]"
               >
                 <Star className="w-3.5 h-3.5" />
                 <span className="font-mono tabular-nums">{user.totalStars}</span>
-              </button>
-            ) : (
-              <button
-                type="button"
-                onClick={() => handleNavigate('profile')}
-                className="rounded-xl bg-amber-400 px-3.5 py-2 text-xs font-bold text-slate-950 hover:bg-amber-300 transition-colors whitespace-nowrap shrink-0 min-h-[36px]"
-              >
-                ورود
               </button>
             )}
           </div>
@@ -318,19 +368,17 @@ export default function MadarApp() {
       </header>
 
       {/* Main Responsive Stage */}
-      <main className="flex-1 max-w-7xl w-full min-w-0 mx-auto px-3.5 sm:px-6 pt-4 sm:pt-5 pb-24 md:pb-12">
+      <main className="flex-1 max-w-5xl w-full min-w-0 mx-auto px-3 sm:px-5 pt-3.5 sm:pt-5 pb-20 md:pb-10">
         {booting ? (
-          <div className="py-24 text-center text-sm text-cyan-200/80">
-            در حال همگام‌سازی منظومه کیهانی مدار...
-          </div>
+          <div className="py-24 text-center text-sm text-slate-400">در حال اتصال به تلگرام...</div>
         ) : (
           <AnimatePresence mode="wait">
             <motion.div
               key={view}
-              initial={liteMode ? false : { opacity: 0, y: 8 }}
+              initial={liteMode ? false : { opacity: 0, y: 6 }}
               animate={{ opacity: 1, y: 0 }}
-              exit={liteMode ? undefined : { opacity: 0, y: -6 }}
-              transition={{ duration: 0.18, ease: [0.16, 1, 0.3, 1] }}
+              exit={liteMode ? undefined : { opacity: 0, y: -4 }}
+              transition={{ duration: 0.16, ease: [0.16, 1, 0.3, 1] }}
               className="min-w-0"
             >
               {view === 'home' && (
@@ -415,16 +463,16 @@ export default function MadarApp() {
         )}
       </main>
 
-      {/* Quiet Editorial Desktop Footer */}
-      <footer className="hidden md:block border-t border-indigo-500/20 py-5 px-6 text-xs text-slate-500">
-        <div className="max-w-7xl mx-auto flex items-center justify-between gap-4">
-          <span>MADAR | مدار — جهان تو، آدم‌های تو، بازی‌های تو</span>
+      {/* Quiet Desktop Footer */}
+      <footer className="hidden md:block border-t border-[#23303e] py-4 px-5 text-xs text-slate-500">
+        <div className="max-w-5xl mx-auto flex items-center justify-between gap-4">
+          <span>مدار | MADAR</span>
           <div className="flex items-center gap-5">
-            <button type="button" onClick={() => handleNavigate('saturn')} className="hover:text-cyan-300">
-              زحل (گروه و هوش مصنوعی)
+            <button type="button" onClick={() => handleNavigate('saturn')} className="hover:text-[#38bdf8]">
+              مدیریت گروه (زحل)
             </button>
             <button type="button" onClick={() => handleNavigate('shop')} className="hover:text-amber-300">
-              فروشگاه ستاره و دعوت
+              فروشگاه ستاره
             </button>
             <button type="button" onClick={() => handleNavigate('admin')} className="hover:text-purple-300">
               پنل مدیریت
@@ -433,8 +481,8 @@ export default function MadarApp() {
         </div>
       </footer>
 
-      {/* Mobile Fixed 5-Tab Bottom Bar (56px height, Telegram Safe Area aware) */}
-      <nav className="md:hidden fixed bottom-0 left-0 right-0 z-40 border-t border-indigo-500/25 bg-[#050816]/95 pb-safe">
+      {/* Mobile Fixed 5-Tab Telegram Bottom Bar */}
+      <nav className="md:hidden fixed bottom-0 left-0 right-0 z-40 border-t border-[#23303e] bg-[#17212b]/98 pb-safe">
         <div className="grid grid-cols-5 h-14 items-center">
           {navItems.map((item) => {
             const Icon = item.icon;
@@ -445,7 +493,7 @@ export default function MadarApp() {
                 type="button"
                 onClick={() => handleNavigate(item.id)}
                 className={`flex flex-col items-center justify-center min-h-[44px] transition-colors ${
-                  active ? 'text-cyan-300' : 'text-slate-400'
+                  active ? 'text-[#38bdf8]' : 'text-slate-400'
                 }`}
               >
                 <Icon className="w-5 h-5" />

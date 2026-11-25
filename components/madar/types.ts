@@ -141,6 +141,7 @@ export interface SanitizedEngineRoom {
   gameType: 'hokm' | 'mafia' | 'quiz' | 'truth_dare';
   isHangout: boolean;
   hostUserId: number;
+  serverNow?: number;
   players: {
     id: string;
     userId: number | null;
@@ -152,6 +153,8 @@ export interface SanitizedEngineRoom {
     status: 'ready' | 'playing' | 'eliminated' | 'left';
   }[];
   hokm?: import('@/lib/hokm-engine').HokmState & {
+    mySeat?: number | null;
+    turnDeadline?: number | null;
     handCounts: { 0: number; 1: number; 2: number; 3: number };
   };
   mafia?: {

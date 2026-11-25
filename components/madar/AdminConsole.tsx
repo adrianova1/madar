@@ -322,7 +322,7 @@ export default function AdminConsole({ onPlanetsUpdated }: AdminConsoleProps) {
             { label: 'کل بازی‌های ثبت‌شده', val: stats.totalGames ?? 0 },
             { label: 'گروه‌های متصل زحل', val: stats.totalGroups ?? 0 },
             { label: 'پیام‌های ناشناس نپتون', val: stats.totalWhispers ?? 0 },
-            { label: 'درخواست‌های Gemini', val: stats.aiCallsCount ?? 0 },
+            { label: 'پاسخ‌های موتور بومی گروه', val: stats.aiCallsCount ?? 0 },
             { label: 'گزارش‌های باز تخلف', val: stats.openReports ?? 0 },
           ].map((kpi) => (
             <div key={kpi.label} className="rounded-2xl border border-slate-800 bg-[#0B1022] p-5 space-y-1.5">
@@ -686,38 +686,38 @@ export default function AdminConsole({ onPlanetsUpdated }: AdminConsoleProps) {
         </div>
       )}
 
-      {/* TAB 6: CPANEL PYTHON 3.11 DEPLOYMENT ARCHITECTURE */}
+      {/* TAB 6: NODE.JS CPANEL / VPS DEPLOYMENT ARCHITECTURE */}
       {tab === 'cpanel' && (
-        <div className="rounded-2xl border border-slate-800 bg-[#0B1022] p-6 space-y-5">
+        <div className="rounded-2xl border border-[#23303E] bg-[#17212B] p-6 space-y-5">
           <div className="flex items-center gap-2 text-base font-bold text-white">
-            <Server className="w-5 h-5 text-amber-400" />
-            <span>نقشه استقرار مستقل روی هاست cPanel (بدون لمس g3pibot)</span>
+            <Server className="w-5 h-5 text-[#38BDF8]" />
+            <span>نقشه استقرار واقعی روی cPanel (Node.js) و سرور VPS</span>
           </div>
 
           <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-xs">
-            <div className="rounded-xl border border-slate-800 bg-[#070B1A] p-4 space-y-2">
-              <p className="font-bold text-amber-300">ایزوله‌سازی کامل از پروژه قبلی</p>
+            <div className="rounded-xl border border-[#23303E] bg-[#0E1621] p-4 space-y-2">
+              <p className="font-bold text-[#38BDF8]">مسیر داده امن و جداگانه</p>
               <p className="text-slate-300 leading-relaxed">
-                مسیر جدید: <code className="font-mono text-sky-300">/home/boysyst3/madar</code> و دیتابیس MySQL جداگانه. هیچ فایل یا جدولی از <code className="font-mono">/home/boysyst3/g3pibot</code> تغییر نمی‌کند.
+                مسیر دیتابیس SQLite از طریق متغیر <code className="font-mono text-sky-300">DATABASE_PATH</code> بیرون از <code className="font-mono">public_html</code> تنظیم می‌شود و در <code className="font-mono">.gitignore</code> مسدود است.
               </p>
             </div>
-            <div className="rounded-xl border border-slate-800 bg-[#070B1A] p-4 space-y-2">
-              <p className="font-bold text-amber-300">سازگار با Passenger + Webhook</p>
+            <div className="rounded-xl border border-[#23303E] bg-[#0E1621] p-4 space-y-2">
+              <p className="font-bold text-[#38BDF8]">نقطه ورود واقعی Node.js 20+</p>
               <p className="text-slate-300 leading-relaxed">
-                فایل‌های آماده <code className="font-mono text-sky-300">passenger_wsgi.py</code>، <code className="font-mono text-sky-300">madar_cpanel_app.py</code> و <code className="font-mono text-sky-300">schema_mysql.sql</code> در پوشه <code className="font-mono">cpanel-deploy/</code> قرار دارند. بدون وابستگی به Docker، Redis یا WebSocket دائمی.
+                فایل <code className="font-mono text-sky-300">cpanel-deploy/server.js</code> برای اجرای Next.js روی cPanel Node.js App یا PM2 در VPS آماده شده است. راهنمای محدودیت‌های RAM و <code className="font-mono">better-sqlite3</code> در <code className="font-mono">DEPLOY_CPANEL.md</code> درج شده است.
               </p>
             </div>
-            <div className="rounded-xl border border-slate-800 bg-[#070B1A] p-4 space-y-2">
-              <p className="font-bold text-amber-300">وابستگی‌های خارجی شفاف</p>
+            <div className="rounded-xl border border-[#23303E] bg-[#0E1621] p-4 space-y-2">
+              <p className="font-bold text-[#38BDF8]">موتور بومی بدون Gemini API</p>
               <p className="text-slate-300 leading-relaxed">
-                ۱) توکن ربات تلگرام (<code className="font-mono">TELEGRAM_BOT_TOKEN</code>) · ۲) کلید Gemini سمت سرور · ۳) درگاه پیامکی ایرانی (کاوه‌نگار یا ملی‌پیامک) برای ارسال واقعی OTP.
+                ۱) توکن ربات تلگرام (<code className="font-mono">TELEGRAM_BOT_TOKEN</code> و <code className="font-mono">TELEGRAM_WEBHOOK_SECRET</code>) · ۲) درگاه پیامک برای OTP (<code className="font-mono">SMS_PROVIDER_URL</code>). بدون نیاز به هیچ API هوش مصنوعی خارجی.
               </p>
             </div>
           </div>
 
-          <div className="rounded-xl border border-slate-800 bg-[#070B1A] p-4 text-xs text-slate-300 space-y-1.5">
+          <div className="rounded-xl border border-[#23303E] bg-[#0E1621] p-4 text-xs text-slate-300 space-y-1.5">
             <p className="font-semibold text-white flex items-center gap-2">
-              <Database className="w-4 h-4 text-sky-400" />
+              <Database className="w-4 h-4 text-[#38BDF8]" />
               <span>مسیر Webhook فعال در نسخه فعلی Next.js:</span>
             </p>
             <p className="font-mono text-sky-300 dir-ltr text-left">

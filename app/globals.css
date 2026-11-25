@@ -8,7 +8,7 @@
 
 @layer base {
   html {
-    background-color: #050816;
+    background-color: #0e1621;
     color: #f1f5f9;
     scroll-behavior: smooth;
     -webkit-text-size-adjust: 100%;
@@ -16,10 +16,10 @@
 
   body {
     font-feature-settings: "ss01" on;
-    background-color: #050816;
+    background-color: #0e1621;
     background-image:
-      radial-gradient(ellipse 70% 45% at 80% 0%, rgba(124, 58, 237, 0.14), transparent 70%),
-      radial-gradient(ellipse 60% 40% at 15% 15%, rgba(56, 189, 248, 0.10), transparent 70%);
+      radial-gradient(ellipse 65% 40% at 85% 0%, rgba(139, 92, 246, 0.09), transparent 70%),
+      radial-gradient(ellipse 55% 35% at 15% 10%, rgba(56, 189, 248, 0.08), transparent 70%);
     min-height: 100dvh;
     padding-top: env(safe-area-inset-top, 0px);
     padding-bottom: env(safe-area-inset-bottom, 0px);
@@ -40,7 +40,7 @@
   padding-bottom: env(safe-area-inset-bottom, 0px);
 }
 
-/* Touch-safe horizontal & vertical scroll containers (prevents gesture lock on mobile) */
+/* Touch-safe horizontal & vertical scroll containers */
 .madar-scroll-x {
   overflow-x: auto;
   overflow-y: hidden;
@@ -60,40 +60,35 @@
   overscroll-behavior-y: contain;
 }
 
-/* Cosmic Glass Surfaces (never applied over WebGL canvas) */
+/* Minimal Telegram-Dark Surfaces with Subtle Cosmic Depth */
 .madar-glass {
-  background: linear-gradient(155deg, rgba(13, 20, 46, 0.88), rgba(7, 11, 28, 0.94));
-  border: 1px solid rgba(124, 58, 237, 0.22);
-  box-shadow:
-    0 12px 34px rgba(2, 6, 23, 0.55),
-    inset 0 1px 0 rgba(148, 163, 184, 0.08);
+  background-color: #17212b;
+  border: 1px solid #23303e;
+  box-shadow: 0 8px 24px rgba(5, 10, 18, 0.35);
 }
 
 .madar-glass-cyan {
-  background: linear-gradient(155deg, rgba(11, 24, 52, 0.88), rgba(6, 12, 30, 0.95));
-  border: 1px solid rgba(34, 211, 238, 0.25);
-  box-shadow:
-    0 10px 30px rgba(2, 6, 23, 0.5),
-    inset 0 1px 0 rgba(56, 189, 248, 0.12);
+  background: linear-gradient(165deg, #192634 0%, #141e29 100%);
+  border: 1px solid rgba(56, 189, 248, 0.24);
+  box-shadow: 0 10px 28px rgba(5, 10, 18, 0.42);
 }
 
 .madar-card-table {
   background:
-    radial-gradient(ellipse 80% 60% at 50% 48%, rgba(16, 65, 82, 0.55), rgba(8, 16, 39, 0.96) 72%),
-    #060b1d;
+    radial-gradient(ellipse 75% 58% at 50% 48%, rgba(20, 68, 88, 0.48), rgba(14, 22, 33, 0.98) 74%),
+    #0e1621;
   box-shadow:
-    inset 0 0 60px rgba(34, 211, 238, 0.08),
-    0 18px 40px rgba(2, 6, 23, 0.65);
+    inset 0 0 48px rgba(56, 189, 248, 0.06),
+    0 12px 32px rgba(4, 8, 16, 0.55);
 }
 
 .madar-starfield {
   background-image:
-    radial-gradient(1px 1px at 14% 22%, rgba(255, 255, 255, 0.65), transparent),
-    radial-gradient(1px 1px at 78% 18%, rgba(56, 189, 248, 0.75), transparent),
-    radial-gradient(1.5px 1.5px at 42% 68%, rgba(167, 139, 250, 0.65), transparent),
-    radial-gradient(1px 1px at 88% 72%, rgba(251, 191, 36, 0.6), transparent),
-    radial-gradient(1px 1px at 26% 84%, rgba(34, 211, 238, 0.55), transparent),
-    radial-gradient(1.2px 1.2px at 61% 34%, rgba(255, 255, 255, 0.5), transparent);
+    radial-gradient(1px 1px at 14% 22%, rgba(255, 255, 255, 0.45), transparent),
+    radial-gradient(1px 1px at 78% 18%, rgba(56, 189, 248, 0.55), transparent),
+    radial-gradient(1.5px 1.5px at 42% 68%, rgba(139, 92, 246, 0.45), transparent),
+    radial-gradient(1px 1px at 88% 72%, rgba(245, 158, 11, 0.4), transparent),
+    radial-gradient(1px 1px at 26% 84%, rgba(56, 189, 248, 0.4), transparent);
   background-size: 260px 260px;
 }
 
@@ -111,16 +106,7 @@
     transform: translateY(0px);
   }
   50% {
-    transform: translateY(-6px);
-  }
-}
-
-@keyframes twinkleDrift {
-  0%, 100% {
-    opacity: 0.45;
-  }
-  50% {
-    opacity: 0.9;
+    transform: translateY(-5px);
   }
 }
 
@@ -132,14 +118,9 @@
   animation: floatGentle 6s ease-in-out infinite;
 }
 
-.animate-twinkle {
-  animation: twinkleDrift 5s ease-in-out infinite;
-}
-
 @media (prefers-reduced-motion: reduce) {
   .animate-orbit-slow,
-  .animate-float-gentle,
-  .animate-twinkle {
+  .animate-float-gentle {
     animation: none !important;
   }
 }

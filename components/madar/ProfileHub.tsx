@@ -103,6 +103,7 @@ export default function ProfileHub({
   const [otpCode, setOtpCode] = useState('');
   const [otpRequested, setOtpRequested] = useState(false);
   const [sandboxOtp, setSandboxOtp] = useState<string | null>(null);
+  const [smsProviderActive, setSmsProviderActive] = useState<boolean | null>(null);
 
   // Personality Test State
   const [questions, setQuestions] = useState<PersonalityQuestionDef[]>([]);
@@ -171,7 +172,7 @@ export default function ProfileHub({
     setAuthError(null);
     const tg = initTelegramMiniApp();
     if (!tg.initData) {
-      setAuthError('داده‌های امضاشده Telegram initData فقط هنگام باز کردن مدار داخل Telegram Mini App در دسترس است.');
+      setAuthError('ورود به مدار فقط از طریق Telegram Mini App امکان‌پذیر است.');
       return;
     }
     const res = await fetch('/api/auth/session', {
@@ -185,19 +186,6 @@ export default function ProfileHub({
       return;
     }
     await onAuthSuccess(data.token, data.currentSessionId);
-  }
-
-  async function handleDemoEnter() {
-    setAuthError(null);
-    const res = await fetch('/api/auth/session', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ mode: 'demo_enter' }),
-    });
-    const data = await res.json();
-    if (res.ok) {
-      await onAuthSuccess(data.token, data.currentSessionId);
-    }
   }
 
   async function saveProfile(e: React.FormEvent) {
@@ -314,6 +302,7 @@ export default function ProfileHub({
     if (res.ok) {
       setOtpRequested(true);
       setSandboxOtp(data.sandboxOtpPreview || null);
+      setSmsProviderActive(typeof data.smsProviderActive === 'boolean' ? data.smsProviderActive : null);
     }
   }
 
@@ -353,20 +342,20 @@ export default function ProfileHub({
 
   // Shared mobile-safe input class: text-base on mobile prevents iOS/Telegram WebView zoom on focus!
   const inputCls =
-    'w-full min-w-0 max-w-full rounded-xl border border-indigo-400/25 bg-[#060a1c] px-3.5 py-2.5 text-base sm:text-sm text-white placeholder:text-slate-500 focus:border-cyan-400 focus:outline-none transition-colors';
+    'w-full min-w-0 max-w-full rounded-xl border border-[#23303E] bg-[#0E1621] px-3.5 py-2.5 text-base sm:text-sm text-white placeholder:text-slate-500 focus:border-[#38BDF8] focus:outline-none transition-colors';
 
   if (!token || !user) {
     return (
       <div className="w-full max-w-xl mx-auto madar-glass rounded-3xl p-4 sm:p-8 space-y-5 overflow-x-clip">
         <div className="space-y-1.5">
-          <p className="text-xs text-cyan-300">حساب واحد تلگرام، مینی‌اپ و وب</p>
+          <p className="text-xs text-[#38BDF8]">حساب واحد تلگرام، مینی‌اپ و وب</p>
           <h1 className="text-xl sm:text-2xl font-bold text-white">ورود یا ساخت حساب در مدار</h1>
           <p className="text-xs text-slate-400 leading-relaxed">
             رمز عبور مدار کاملاً مستقل از رمز حساب تلگرام شماست و با هش امن scrypt روی سرور نگهداری می‌شود.
           </p>
         </div>
 
-        <div className="grid grid-cols-2 gap-1 p-1 bg-[#050816] border border-indigo-500/25 rounded-xl">
+        <div className="grid grid-cols-2 gap-1 p-1 bg-[#0E1621] border border-[#23303E] rounded-xl">
           <button
             type="button"
             onClick={() => setAuthMode('login')}
@@ -403,7 +392,7 @@ export default function ProfileHub({
               autoCorrect="off"
               value={username}
               onChange={(e) => setUsername(e.target.value)}
-              placeholder="مثلاً parham_sky"
+              placeholder="مثلاً ali_madar"
               className={`${inputCls} dir-ltr text-left`}
             />
           </div>
@@ -467,20 +456,13 @@ export default function ProfileHub({
           </button>
         </form>
 
-        <div className="pt-4 border-t border-indigo-500/20 grid grid-cols-1 sm:grid-cols-2 gap-3">
+        <div className="pt-4 border-t border-[#23303E]">
           <button
             type="button"
             onClick={handleTelegramLogin}
-            className="w-full rounded-xl border border-cyan-400/40 bg-cyan-400/10 px-3 py-2.5 text-xs font-semibold text-cyan-200 hover:bg-cyan-400/20 min-h-[44px]"
+            className="w-full rounded-xl border border-[#38BDF8]/40 bg-[#38BDF8]/10 px-3 py-2.5 text-xs font-semibold text-sky-200 hover:bg-[#38BDF8]/20 min-h-[44px]"
           >
-            ورود با امضای Telegram Mini App
-          </button>
-          <button
-            type="button"
-            onClick={handleDemoEnter}
-            className="w-full rounded-xl border border-indigo-400/30 bg-[#050816] px-3 py-2.5 text-xs font-semibold text-slate-200 hover:border-amber-400 min-h-[44px]"
-          >
-            ورود سریع با حساب آماده (@parham_sky)
+            ورود مستقیم با امضای Telegram Mini App
           </button>
         </div>
       </div>
@@ -518,7 +500,7 @@ export default function ProfileHub({
 
           {/* Touch-safe full-width scrollable tab bar (replaces broken w-fit overflow) */}
           <div className="w-full md:w-auto max-w-full madar-scroll-x">
-            <div className="inline-flex items-center gap-1 p-1 bg-[#050816] border border-indigo-500/25 rounded-xl min-w-full sm:min-w-0">
+            <div className="inline-flex items-center gap-1 p-1 bg-[#0E1621] border border-[#23303E] rounded-xl min-w-full sm:min-w-0">
               {[
                 { id: 'info', label: 'پروفایل و ونوس' },
                 { id: 'personality', label: `آزمون شخصیت (${completionPercent}%)` },
@@ -530,7 +512,7 @@ export default function ProfileHub({
                   onClick={() => setProfileTab(t.id as 'info' | 'personality' | 'security')}
                   className={`flex-1 sm:flex-none px-3.5 py-2 text-xs font-semibold rounded-lg whitespace-nowrap shrink-0 min-h-[42px] transition-colors ${
                     profileTab === t.id
-                      ? 'bg-amber-400 text-slate-950'
+                      ? 'bg-[#38BDF8] text-[#0E1621]'
                       : 'text-slate-300 hover:text-white'
                   }`}
                 >
@@ -542,32 +524,32 @@ export default function ProfileHub({
         </div>
 
         {/* Cosmic Identity Strip: Personal Star, Level, Badges & Constellation */}
-        <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5 pt-4 border-t border-indigo-500/20">
-          <div className="rounded-xl bg-[#050816]/90 border border-indigo-500/20 p-3 min-w-0">
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5 pt-4 border-t border-[#23303E]">
+          <div className="rounded-xl bg-[#0E1621] border border-[#23303E] p-3 min-w-0">
             <p className="text-[11px] text-slate-400 flex items-center gap-1">
-              <Sparkles className="w-3.5 h-3.5 text-cyan-400 shrink-0" />
+              <Sparkles className="w-3.5 h-3.5 text-[#38BDF8] shrink-0" />
               <span className="truncate">ستاره شخصی</span>
             </p>
             <p className="text-xs sm:text-sm font-bold text-white mt-1 truncate">
               {user.planetEvolution?.title || 'زمینِ نوبنیاد'}
             </p>
           </div>
-          <div className="rounded-xl bg-[#050816]/90 border border-indigo-500/20 p-3 min-w-0">
+          <div className="rounded-xl bg-[#0E1621] border border-[#23303E] p-3 min-w-0">
             <p className="text-[11px] text-slate-400">تجربه و سطح</p>
             <p className="text-xs sm:text-sm font-mono tabular-nums font-bold text-amber-300 mt-1">
               LVL {user.level} · {user.xp} XP
             </p>
           </div>
-          <div className="rounded-xl bg-[#050816]/90 border border-indigo-500/20 p-3 min-w-0">
+          <div className="rounded-xl bg-[#0E1621] border border-[#23303E] p-3 min-w-0">
             <p className="text-[11px] text-slate-400 flex items-center gap-1">
-              <Award className="w-3.5 h-3.5 text-purple-400 shrink-0" />
+              <Award className="w-3.5 h-3.5 text-[#8B5CF6] shrink-0" />
               <span className="truncate">نشان‌ها و بازی</span>
             </p>
             <p className="text-xs sm:text-sm font-mono tabular-nums font-bold text-slate-100 mt-1">
               {user.earnedBadges?.length || 0} نشان · {user.gamesPlayedCount} بازی
             </p>
           </div>
-          <div className="rounded-xl bg-[#050816]/90 border border-indigo-500/20 p-3 min-w-0">
+          <div className="rounded-xl bg-[#0E1621] border border-[#23303E] p-3 min-w-0">
             <p className="text-[11px] text-slate-400 flex items-center gap-1">
               <Users className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
               <span className="truncate">صورت‌فلکی دوستان</span>
@@ -676,7 +658,7 @@ export default function ProfileHub({
               />
             </div>
 
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 pt-2 border-t border-indigo-500/20">
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 pt-2 border-t border-[#23303E]">
               {[
                 { label: 'مخفی‌کردن شهر من', val: hideCity, set: setHideCity },
                 { label: 'مخفی‌کردن وضعیت آنلاین', val: hideOnline, set: setHideOnline },
@@ -684,25 +666,25 @@ export default function ProfileHub({
               ].map((tog) => (
                 <label
                   key={tog.label}
-                  className="flex items-center justify-between gap-2 rounded-xl border border-indigo-500/20 bg-[#050816] px-3.5 py-3 text-xs text-slate-200 cursor-pointer min-h-[46px]"
+                  className="flex items-center justify-between gap-2 rounded-xl border border-[#23303E] bg-[#0E1621] px-3.5 py-3 text-xs text-slate-200 cursor-pointer min-h-[46px]"
                 >
                   <span className="leading-snug">{tog.label}</span>
                   <input
                     type="checkbox"
                     checked={tog.val}
                     onChange={(e) => tog.set(e.target.checked)}
-                    className="accent-amber-400 w-4 h-4 shrink-0"
+                    className="accent-[#38BDF8] w-4 h-4 shrink-0"
                   />
                 </label>
               ))}
             </div>
 
             {/* Keyboard-safe & Mobile-safe Submit Bar (never pushed off-screen) */}
-            <div className="sticky bottom-16 md:bottom-3 z-20 -mx-4 sm:mx-0 px-4 sm:px-0 py-2.5 bg-[#080e24]/95 sm:bg-transparent border-t border-indigo-500/20 sm:border-0 flex justify-end">
+            <div className="sticky bottom-16 md:bottom-3 z-20 -mx-4 sm:mx-0 px-4 sm:px-0 py-2.5 bg-[#17212B]/95 sm:bg-transparent border-t border-[#23303E] sm:border-0 flex justify-end">
               <button
                 type="submit"
                 disabled={savingProfile}
-                className="w-full sm:w-auto inline-flex items-center justify-center gap-2 rounded-xl bg-amber-400 px-6 py-3 text-sm font-bold text-slate-950 hover:bg-amber-300 disabled:opacity-60 min-h-[48px] shadow-lg shadow-amber-500/15"
+                className="w-full sm:w-auto inline-flex items-center justify-center gap-2 rounded-xl bg-[#38BDF8] px-6 py-3 text-sm font-bold text-[#0E1621] hover:bg-sky-300 disabled:opacity-60 min-h-[48px] shadow-lg shadow-sky-500/15"
               >
                 <UserCheck className="w-4 h-4 shrink-0" />
                 <span>{savingProfile ? 'در حال ذخیره...' : 'ذخیره پروفایل اجتماعی'}</span>
@@ -999,10 +981,15 @@ export default function ProfileHub({
               </div>
 
               {otpRequested && (
-                <div className="space-y-2.5 pt-2 border-t border-indigo-500/20">
+                <div className="space-y-2.5 pt-2 border-t border-[#23303E]">
+                  {smsProviderActive === true && (
+                    <p className="text-xs text-emerald-300">
+                      کد تأیید از طریق درگاه پیامک برای شماره شما ارسال شد.
+                    </p>
+                  )}
                   {sandboxOtp && (
-                    <p className="text-xs text-cyan-300 font-mono break-all">
-                      کد آزمایشی: <strong>{sandboxOtp}</strong>
+                    <p className="text-xs text-sky-300 font-mono break-all">
+                      کد محیط توسعه (فقط حالت Development): <strong>{sandboxOtp}</strong>
                     </p>
                   )}
                   <div className="flex flex-col sm:flex-row gap-2.5">

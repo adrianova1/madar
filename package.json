@@ -10,7 +10,6 @@
     "clean": "next clean"
   },
   "dependencies": {
-    "@google/genai": "^3.6.1",
     "@hookform/resolvers": "^5.2.1",
     "@types/better-sqlite3": "^9.6.0",
     "@types/three": "^0.187.0",
