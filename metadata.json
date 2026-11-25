@@ -1,0 +1,6 @@
+{
+  "name": "MADAR | مدار",
+  "description": "جهان تو، آدم‌های تو، بازی‌های تو — پلتفرم اجتماعی، آشنایی، بازی‌های گروهی، نجوا و دستیار هوشمند تلگرام",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
