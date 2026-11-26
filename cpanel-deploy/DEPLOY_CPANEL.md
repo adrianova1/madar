@@ -26,23 +26,26 @@
 NODE_ENV=production
 PORT=3000
 APP_URL=https://madar.yourdomain.com
-NEXT_PUBLIC_TELEGRAM_BOT_USERNAME=YourMadarBot
+TELEGRAM_BOT_USERNAME=m4d4rbot
+NEXT_PUBLIC_TELEGRAM_BOT_USERNAME=m4d4rbot
 
 # مسیر فایل دیتابیس SQLite بیرون از پوشه عمومی وب
 DATABASE_PATH=/home/YOUR_CPANEL_USER/madar_data/madar.db
 
-# توکن واقعی ربات تلگرام از @BotFather
+# کلید امضای نشست‌های سرور (الزامی در Production - حداقل ۳۲ کاراکتر تصادفی)
+SESSION_SECRET=replace-with-strong-random-64-char-hex-secret
+
+# توکن واقعی ربات @m4d4rbot از @BotFather
 TELEGRAM_BOT_TOKEN=123456789:REPLACE_WITH_REAL_BOT_TOKEN
 
 # رمز تصادفی طولانی (حداقل ۳۲ کاراکتر) برای احراز اصالت Webhook تلگرام
 TELEGRAM_WEBHOOK_SECRET=replace-with-strong-random-hex-secret
 
-# رمز پنل مدیریت مدار (حداقل ۱۶ کاراکتر)
-MADAR_ADMIN_PASSCODE=replace-with-strong-admin-passcode
+# شناسه عددی تلگرام مدیر اصلی (تنها مرجع ورود به پنل مخفی /admin)
+ADMIN_TELEGRAM_ID=123456789
 
-# درگاه واقعی پیامک برای ارسال OTP شماره‌های +98 (در صورت نبودن، OTP در Production غیرفعال می‌ماند)
-SMS_PROVIDER_URL=https://your-sms-gateway.example/send
-SMS_PROVIDER_API_KEY=replace-with-real-sms-api-key
+# کانال‌های عضویت اجباری (اختیاری - قابل ویرایش از پنل مدیریت)
+REQUIRED_TELEGRAM_CHANNELS=
 ```
 
 ---
@@ -119,7 +122,7 @@ curl -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook" \
   -d '{
     "url": "https://madar.yourdomain.com/api/telegram/webhook",
     "secret_token": "YOUR_TELEGRAM_WEBHOOK_SECRET",
-    "allowed_updates": ["message"]
+    "allowed_updates": ["message", "callback_query"]
   }'
 ```
 

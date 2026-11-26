@@ -1,29 +1,19 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { z } from 'zod';
-import crypto from 'crypto';
 import { adjustStarsAtomic, getDb } from '@/lib/db';
 import {
   checkRateLimit,
-  createAdminSession,
-  getAdminSession,
+  DelegatedAdminEntry,
+  getAuthUser,
   getClientIp,
-  hashPassword,
-  verifyPassword,
+  getDelegatedAdmins,
+  isSessionSecretConfigured,
+  resolveAdminAuthority,
   writeAuditLog,
 } from '@/lib/security';
+import { ForcedChannelConfig, getBotUsername, getForcedChannels } from '@/lib/telegram-bot';
 
 const AdminActionSchema = z.discriminatedUnion('action', [
-  z.object({
-    action: z.literal('claim'),
-    username: z.string().min(3).max(32).default('superadmin'),
-    password: z.string().min(8, 'رمز مدیریت باید حداقل ۸ کاراکتر باشد').max(128),
-  }),
-  z.object({
-    action: z.literal('login'),
-    username: z.string().min(1).max(40),
-    password: z.string().min(1).max(128),
-    role: z.enum(['Super Admin', 'Admin', 'Moderator', 'Support', 'Content Manager', 'Game Manager']).optional(),
-  }),
   z.object({
     action: z.literal('ban_user'),
     userId: z.number().int().positive(),
@@ -55,15 +45,18 @@ const AdminActionSchema = z.discriminatedUnion('action', [
   }),
   z.object({
     action: z.literal('import_quiz'),
-    questions: z.array(
-      z.object({
-        category: z.string().min(2).max(40),
-        question: z.string().min(6).max(240),
-        options: z.array(z.string().min(1).max(80)).length(4),
-        correctIndex: z.number().int().min(0).max(3),
-        difficulty: z.string().max(20).default('متوسط'),
-      })
-    ).min(1).max(50),
+    questions: z
+      .array(
+        z.object({
+          category: z.string().min(2).max(40),
+          question: z.string().min(6).max(240),
+          options: z.array(z.string().min(1).max(80)).length(4),
+          correctIndex: z.number().int().min(0).max(3),
+          difficulty: z.string().max(20).default('متوسط'),
+        })
+      )
+      .min(1)
+      .max(50),
   }),
   z.object({
     action: z.literal('add_td_prompt'),
@@ -82,30 +75,71 @@ const AdminActionSchema = z.discriminatedUnion('action', [
     userId: z.number().int().positive(),
     decision: z.enum(['verified', 'rejected']),
   }),
+  z.object({
+    action: z.literal('update_forced_channels'),
+    channels: z
+      .array(
+        z.object({
+          id: z.string().min(1).max(40),
+          chatId: z.string().min(2).max(80),
+          title: z.string().min(1).max(80),
+          inviteUrl: z
+            .string()
+            .url()
+            .refine((u) => /^https:\/\/t\.me\//i.test(u), 'لینک کانال باید با https://t.me/ شروع شود'),
+          enabled: z.boolean(),
+        })
+      )
+      .max(10),
+  }),
+  z.object({
+    action: z.literal('update_bot_settings'),
+    welcomeText: z.string().min(2).max(300),
+    requirePhoneContact: z.boolean(),
+    maintenanceMode: z.boolean(),
+  }),
+  z.object({
+    action: z.literal('toggle_group_rule'),
+    groupId: z.number().int().positive(),
+    field: z.enum(['anti_link', 'anti_ads', 'anti_spam', 'anti_flood', 'anti_tabchi', 'lock_media']),
+    enabled: z.boolean(),
+  }),
+  z.object({
+    action: z.literal('cleanup_stale_rooms'),
+  }),
+  z.object({
+    action: z.literal('clear_error_logs'),
+  }),
+  z.object({
+    action: z.literal('add_delegated_admin'),
+    telegramId: z.string().regex(/^\d{5,20}$/, 'شناسه عددی تلگرام معتبر وارد کنید'),
+    label: z.string().min(2).max(40),
+    role: z.enum(['Admin', 'Moderator', 'Support', 'Content Manager', 'Game Manager']),
+  }),
+  z.object({
+    action: z.literal('remove_delegated_admin'),
+    telegramId: z.string().regex(/^\d{5,20}$/),
+  }),
 ]);
 
-function safeCompareSecret(input: string, envSecret: string): boolean {
-  const a = crypto.createHash('sha256').update(input).digest();
-  const b = crypto.createHash('sha256').update(envSecret).digest();
-  return crypto.timingSafeEqual(a, b);
+function requireVerifiedAdmin(req: NextRequest) {
+  const auth = getAuthUser(req);
+  if (!auth) {
+    return { ok: false as const, response: NextResponse.json({ error: 'احراز هویت تلگرام الزامی است.' }, { status: 401 }) };
+  }
+  const authority = resolveAdminAuthority(auth);
+  if (!authority.isAdmin) {
+    return { ok: false as const, response: NextResponse.json({ error: 'دسترسی غیرمجاز.' }, { status: 403 }) };
+  }
+  return { ok: true as const, auth, authority };
 }
 
 export async function GET(req: NextRequest) {
+  const gate = requireVerifiedAdmin(req);
+  if (!gate.ok) return gate.response;
+
+  const { auth, authority } = gate;
   const db = getDb();
-  const envPasscode = process.env.MADAR_ADMIN_PASSCODE?.trim() || '';
-  const claimedRow = db.prepare('SELECT username, role, claimed_at FROM admin_credentials WHERE id = 1').get() as
-    | { username: string; role: string; claimed_at: string }
-    | undefined;
-
-  const adminSess = getAdminSession(req);
-  if (!adminSess) {
-    return NextResponse.json({
-      authenticated: false,
-      envPasscodeConfigured: Boolean(envPasscode),
-      needsFirstRunClaim: !envPasscode && !claimedRow,
-    });
-  }
-
   const search = req.nextUrl.searchParams.get('q')?.trim().toLowerCase() || '';
 
   const stats = {
@@ -113,50 +147,72 @@ export async function GET(req: NextRequest) {
     verifiedUsers: (db.prepare('SELECT COUNT(*) as c FROM users WHERE phone_verified = 1 AND is_deleted = 0').get() as { c: number }).c,
     activeMatches: (db.prepare("SELECT COUNT(*) as c FROM matches WHERE status = 'active'").get() as { c: number }).c,
     totalGames: (db.prepare('SELECT COUNT(*) as c FROM game_history').get() as { c: number }).c,
+    activeRooms: (db.prepare("SELECT COUNT(*) as c FROM engine_rooms WHERE status != 'finished'").get() as { c: number }).c,
     totalGroups: (db.prepare('SELECT COUNT(*) as c FROM telegram_groups').get() as { c: number }).c,
     totalWhispers: (db.prepare('SELECT COUNT(*) as c FROM whispers').get() as { c: number }).c,
-    aiCallsCount: (db.prepare('SELECT COUNT(*) as c FROM ai_usage_logs').get() as { c: number }).c,
     openReports: (db.prepare("SELECT COUNT(*) as c FROM reports WHERE status = 'open'").get() as { c: number }).c,
+    errorCount: (db.prepare('SELECT COUNT(*) as c FROM system_error_logs').get() as { c: number }).c,
   };
 
   const users = search
     ? db
         .prepare(`
-          SELECT u.id, u.username, u.display_name, u.phone_verified, u.subscription_tier, u.level, u.is_banned, u.created_at,
+          SELECT u.id, u.telegram_id, u.username, u.display_name, u.phone_verified, u.onboarding_completed,
+                 u.subscription_tier, u.level, u.is_banned, u.created_at, u.last_login_at,
                  p.city, w.free_stars, w.paid_stars
           FROM users u
           JOIN user_profiles p ON p.user_id = u.id
           JOIN star_wallets w ON w.user_id = u.id
-          WHERE u.is_deleted = 0 AND (lower(u.username) LIKE ? OR lower(u.display_name) LIKE ?)
-          ORDER BY u.id DESC LIMIT 30
+          WHERE u.is_deleted = 0 AND (lower(u.username) LIKE ? OR lower(u.display_name) LIKE ? OR u.telegram_id LIKE ?)
+          ORDER BY u.id DESC LIMIT 40
         `)
-        .all(`%${search}%`, `%${search}%`)
+        .all(`%${search}%`, `%${search}%`, `%${search}%`)
     : db
         .prepare(`
-          SELECT u.id, u.username, u.display_name, u.phone_verified, u.subscription_tier, u.level, u.is_banned, u.created_at,
+          SELECT u.id, u.telegram_id, u.username, u.display_name, u.phone_verified, u.onboarding_completed,
+                 u.subscription_tier, u.level, u.is_banned, u.created_at, u.last_login_at,
                  p.city, w.free_stars, w.paid_stars
           FROM users u
           JOIN user_profiles p ON p.user_id = u.id
           JOIN star_wallets w ON w.user_id = u.id
           WHERE u.is_deleted = 0
-          ORDER BY u.id DESC LIMIT 30
+          ORDER BY u.id DESC LIMIT 40
         `)
         .all();
+
+  const groups = db
+    .prepare(`
+      SELECT id, chat_id, title, member_count, bot_is_admin, anti_link, anti_ads, anti_spam, anti_flood, anti_tabchi, lock_media, sensitivity_level
+      FROM telegram_groups
+      ORDER BY id DESC LIMIT 30
+    `)
+    .all();
+
+  const moderationLogs = db
+    .prepare('SELECT id, group_id, command, target_label, reason, actor_label, created_at FROM moderation_logs ORDER BY id DESC LIMIT 25')
+    .all();
+
+  const activeEngineRooms = db
+    .prepare('SELECT room_code, game_type, is_hangout, status, created_at, updated_at FROM engine_rooms ORDER BY updated_at DESC LIMIT 25')
+    .all();
 
   const planetsRow = db.prepare("SELECT value_json FROM system_settings WHERE key = 'planets'").get() as
     | { value_json: string }
     | undefined;
+  const botSettingsRow = db.prepare("SELECT value_json FROM system_settings WHERE key = 'bot_settings'").get() as
+    | { value_json: string }
+    | undefined;
 
   const reports = db
-    .prepare('SELECT id, reporter_id, target_type, target_id, reason, status, created_at FROM reports ORDER BY id DESC LIMIT 20')
+    .prepare('SELECT id, reporter_id, target_type, target_id, reason, status, created_at FROM reports ORDER BY id DESC LIMIT 25')
     .all();
 
   const auditLogs = db
     .prepare('SELECT id, admin_username, admin_role, action, target, details, created_at FROM audit_logs ORDER BY id DESC LIMIT 30')
     .all();
 
-  const aiLogs = db
-    .prepare('SELECT id, model, prompt_chars, response_chars, status, created_at FROM ai_usage_logs ORDER BY id DESC LIMIT 15')
+  const errorLogs = db
+    .prepare('SELECT id, source, message, details, created_at FROM system_error_logs ORDER BY id DESC LIMIT 30')
     .all();
 
   const quizCount = (db.prepare('SELECT COUNT(*) as c FROM quiz_questions').get() as { c: number }).c;
@@ -174,26 +230,59 @@ export async function GET(req: NextRequest) {
     `)
     .all();
 
+  const forcedChannels: ForcedChannelConfig[] = getForcedChannels();
+  const delegatedAdmins: DelegatedAdminEntry[] = getDelegatedAdmins();
+
   return NextResponse.json({
     authenticated: true,
-    admin: adminSess,
+    admin: {
+      username: auth.username,
+      displayName: auth.display_name,
+      telegramId: auth.telegram_id,
+      role: authority.role,
+      isPrimaryAdmin: authority.isPrimaryAdmin,
+    },
     stats,
     users,
+    groups,
+    moderationLogs,
+    activeEngineRooms,
     planets: planetsRow ? JSON.parse(planetsRow.value_json) : [],
+    botSettings: botSettingsRow
+      ? JSON.parse(botSettingsRow.value_json)
+      : { welcomeText: 'به مدار خوش آمدی.', requirePhoneContact: true, maintenanceMode: false },
+    forcedChannels,
+    delegatedAdmins,
     reports,
     adultVerifications,
     auditLogs,
-    aiLogs,
+    errorLogs,
     contentCounts: { quizCount, tdCount },
+    systemStatus: {
+      nodeEnv: process.env.NODE_ENV || 'development',
+      botUsername: getBotUsername(),
+      hasBotToken: Boolean(process.env.TELEGRAM_BOT_TOKEN?.trim()),
+      hasWebhookSecret: Boolean(process.env.TELEGRAM_WEBHOOK_SECRET?.trim()),
+      hasSessionSecret: isSessionSecretConfigured(),
+      hasAdminTelegramId: Boolean(process.env.ADMIN_TELEGRAM_ID?.trim()),
+      previewDisabledInProd: process.env.NODE_ENV === 'production',
+    },
   });
 }
 
 export async function POST(req: NextRequest) {
   const ip = getClientIp(req);
-  const rl = checkRateLimit(`admin:${ip}`, 25, 10 * 60 * 1000);
+  const rl = checkRateLimit(`admin:${ip}`, 40, 10 * 60 * 1000);
   if (!rl.allowed) {
     return NextResponse.json({ error: 'تعداد درخواست‌های پنل مدیریت بیش از حد مجاز است.' }, { status: 429 });
   }
+
+  const gate = requireVerifiedAdmin(req);
+  if (!gate.ok) return gate.response;
+
+  const { auth, authority } = gate;
+  const adminActor = auth.username;
+  const adminRole = authority.role || 'Admin';
 
   const body = await req.json().catch(() => null);
   const parsed = AdminActionSchema.safeParse(body);
@@ -203,70 +292,21 @@ export async function POST(req: NextRequest) {
 
   const db = getDb();
   const data = parsed.data;
-  const envPasscode = process.env.MADAR_ADMIN_PASSCODE?.trim() || '';
-
-  if (data.action === 'claim') {
-    if (envPasscode) {
-      return NextResponse.json({ error: 'گذرواژه مدیریت در متغیر محیطی سرور تنظیم شده است؛ مستقیماً وارد شوید.' }, { status: 403 });
-    }
-    const existing = db.prepare('SELECT 1 FROM admin_credentials WHERE id = 1').get();
-    if (existing) {
-      return NextResponse.json({ error: 'حساب مدیر ارشد قبلاً ثبت و قفل شده است. با فرم ورود وارد شوید.' }, { status: 409 });
-    }
-
-    const hash = hashPassword(data.password);
-    const uname = data.username.trim();
-    db.prepare("INSERT INTO admin_credentials (id, username, password_hash, role) VALUES (1, ?, ?, 'Super Admin')").run(uname, hash);
-    writeAuditLog(uname, 'Super Admin', 'ADMIN_BOOTSTRAP_CLAIM', 'admin_credentials', 'اولین مدیر ارشد ثبت و مسیر راه‌اندازی قفل شد.');
-    const adminToken = createAdminSession(uname, 'Super Admin');
-    return NextResponse.json({ ok: true, adminToken, admin: { username: uname, role: 'Super Admin' } }, { status: 201 });
-  }
-
-  if (data.action === 'login') {
-    const claimedRow = db.prepare('SELECT username, password_hash, role FROM admin_credentials WHERE id = 1').get() as
-      | { username: string; password_hash: string; role: string }
-      | undefined;
-
-    let valid = false;
-    let role: string = data.role || 'Super Admin';
-    if (envPasscode) {
-      valid = safeCompareSecret(data.password, envPasscode);
-    } else if (claimedRow) {
-      valid =
-        claimedRow.username.toLowerCase() === data.username.trim().toLowerCase() &&
-        verifyPassword(data.password, claimedRow.password_hash);
-      role = data.role || claimedRow.role;
-    }
-
-    if (!valid) {
-      return NextResponse.json({ error: 'نام کاربری یا رمز عبور مدیریت نادرست است.' }, { status: 401 });
-    }
-
-    const adminToken = createAdminSession(data.username.trim(), role);
-    writeAuditLog(data.username.trim(), role, 'ADMIN_LOGIN', 'admin_panel', `ورود از IP ${ip}`);
-    return NextResponse.json({ ok: true, adminToken, admin: { username: data.username.trim(), role } });
-  }
-
-  // All subsequent operations require verified Admin session
-  const adminSess = getAdminSession(req);
-  if (!adminSess) {
-    return NextResponse.json({ error: 'احراز هویت مدیر الزامی است.' }, { status: 401 });
-  }
 
   if (data.action === 'ban_user') {
     db.prepare('UPDATE users SET is_banned = ? WHERE id = ?').run(data.banned ? 1 : 0, data.userId);
     if (data.banned) {
       db.prepare('UPDATE user_sessions SET revoked = 1 WHERE user_id = ?').run(data.userId);
     }
-    writeAuditLog(adminSess.username, adminSess.role, data.banned ? 'USER_BAN' : 'USER_UNBAN', `user:${data.userId}`);
+    writeAuditLog(adminActor, adminRole, data.banned ? 'USER_BAN' : 'USER_UNBAN', `user:${data.userId}`);
     return NextResponse.json({ ok: true, message: data.banned ? 'کاربر مسدود شد.' : 'مسدودیت کاربر برداشته شد.' });
   }
 
   if (data.action === 'adjust_stars') {
     try {
       const w = adjustStarsAtomic(data.userId, data.delta, 'free', 'admin_adjustment', `تعدیل مدیریت: ${data.reason}`);
-      writeAuditLog(adminSess.username, adminSess.role, 'STAR_ADJUST', `user:${data.userId}`, `${data.delta} | ${data.reason}`);
-      return NextResponse.json({ ok: true, wallet: w, message: 'موجودی ستاره کاربر با ثبت در دفتر کل به‌روز شد.' });
+      writeAuditLog(adminActor, adminRole, 'STAR_ADJUST', `user:${data.userId}`, `${data.delta} | ${data.reason}`);
+      return NextResponse.json({ ok: true, wallet: w, message: 'موجودی ستاره کاربر به‌روز شد.' });
     } catch (e) {
       return NextResponse.json({ error: e instanceof Error ? e.message : 'خطا در تعدیل ستاره' }, { status: 400 });
     }
@@ -274,7 +314,7 @@ export async function POST(req: NextRequest) {
 
   if (data.action === 'update_tier') {
     db.prepare('UPDATE users SET subscription_tier = ? WHERE id = ?').run(data.tier, data.userId);
-    writeAuditLog(adminSess.username, adminSess.role, 'SUBSCRIPTION_CHANGE', `user:${data.userId}`, `tier=${data.tier}`);
+    writeAuditLog(adminActor, adminRole, 'SUBSCRIPTION_CHANGE', `user:${data.userId}`, `tier=${data.tier}`);
     return NextResponse.json({ ok: true, message: 'سطح اشتراک کاربر تغییر کرد.' });
   }
 
@@ -282,8 +322,8 @@ export async function POST(req: NextRequest) {
     db.prepare("INSERT OR REPLACE INTO system_settings (key, value_json, updated_at) VALUES ('planets', ?, datetime('now'))").run(
       JSON.stringify(data.planets)
     );
-    writeAuditLog(adminSess.username, adminSess.role, 'PLANETS_UPDATE', 'system_settings', `${data.planets.length} سیاره به‌روز شد`);
-    return NextResponse.json({ ok: true, message: 'چیدمان و عناوین سیارات مدار ذخیره شد.' });
+    writeAuditLog(adminActor, adminRole, 'PLANETS_UPDATE', 'system_settings', `${data.planets.length} سیاره`);
+    return NextResponse.json({ ok: true, message: 'چیدمان سیارات ذخیره شد.' });
   }
 
   if (data.action === 'import_quiz') {
@@ -295,8 +335,8 @@ export async function POST(req: NextRequest) {
         insert.run(q.category, q.question, JSON.stringify(q.options), q.correctIndex, q.difficulty);
       }
     })();
-    writeAuditLog(adminSess.username, adminSess.role, 'QUIZ_BULK_IMPORT', 'quiz_questions', `${data.questions.length} سؤال افزوده شد`);
-    return NextResponse.json({ ok: true, message: `${data.questions.length} سؤال جدید به بانک کوییز عطارد اضافه شد.` });
+    writeAuditLog(adminActor, adminRole, 'QUIZ_BULK_IMPORT', 'quiz_questions', `${data.questions.length} سؤال`);
+    return NextResponse.json({ ok: true, message: `${data.questions.length} سؤال جدید اضافه شد.` });
   }
 
   if (data.action === 'add_td_prompt') {
@@ -306,13 +346,13 @@ export async function POST(req: NextRequest) {
       data.text,
       data.isAdult ? 1 : 0
     );
-    writeAuditLog(adminSess.username, adminSess.role, 'TD_ADD_PROMPT', 'truth_dare_prompts', `${data.mode} / ${data.category}`);
-    return NextResponse.json({ ok: true, message: 'آیتم جدید جرئت و حقیقت به سیاره مریخ اضافه شد.' });
+    writeAuditLog(adminActor, adminRole, 'TD_ADD_PROMPT', 'truth_dare_prompts', `${data.mode} / ${data.category}`);
+    return NextResponse.json({ ok: true, message: 'مورد جدید جرئت و حقیقت ثبت شد.' });
   }
 
   if (data.action === 'resolve_report') {
     db.prepare('UPDATE reports SET status = ? WHERE id = ?').run(data.status, data.reportId);
-    writeAuditLog(adminSess.username, adminSess.role, 'REPORT_RESOLVE', `report:${data.reportId}`, data.status);
+    writeAuditLog(adminActor, adminRole, 'REPORT_RESOLVE', `report:${data.reportId}`, data.status);
     return NextResponse.json({ ok: true, message: 'وضعیت گزارش تخلف به‌روزرسانی شد.' });
   }
 
@@ -321,27 +361,95 @@ export async function POST(req: NextRequest) {
       UPDATE adult_verifications
       SET status = ?, reviewed_by = ?, reviewed_at = datetime('now'), updated_at = datetime('now')
       WHERE user_id = ?
-    `).run(data.decision, adminSess.username, data.userId);
+    `).run(data.decision, adminActor, data.userId);
 
     db.prepare("INSERT INTO notifications (user_id, type, title, body) VALUES (?, 'security', ?, ?)").run(
       data.userId,
       data.decision === 'verified' ? 'احراز سن ۱۸+ تأیید شد' : 'درخواست احراز سن ۱۸+ رد شد',
       data.decision === 'verified'
-        ? 'درخواست احراز سن و رضایت‌نامه ۱۸+ شما تأیید شد. اکنون می‌توانید با اختیار کامل به محتوای مجاز بزرگسالان دسترسی داشته باشید.'
-        : 'درخواست احراز سن ۱۸+ شما تأیید نشد. دسترسی بزرگسالان همچنان قفل است.'
+        ? 'درخواست احراز سن ۱۸+ شما تأیید شد.'
+        : 'درخواست احراز سن ۱۸+ شما تأیید نشد.'
     );
 
-    writeAuditLog(
-      adminSess.username,
-      adminSess.role,
-      'ADULT_VERIFICATION_REVIEW',
-      `user:${data.userId}`,
-      data.decision
-    );
+    writeAuditLog(adminActor, adminRole, 'ADULT_VERIFICATION_REVIEW', `user:${data.userId}`, data.decision);
     return NextResponse.json({
       ok: true,
-      message: data.decision === 'verified' ? 'درخواست احراز سن ۱۸+ تأیید شد.' : 'درخواست احراز سن ۱۸+ رد شد.',
+      message: data.decision === 'verified' ? 'درخواست احراز ۱۸+ تأیید شد.' : 'درخواست احراز ۱۸+ رد شد.',
     });
+  }
+
+  if (data.action === 'update_forced_channels') {
+    db.prepare("INSERT OR REPLACE INTO system_settings (key, value_json, updated_at) VALUES ('forced_channels', ?, datetime('now'))").run(
+      JSON.stringify(data.channels)
+    );
+    writeAuditLog(adminActor, adminRole, 'FORCED_CHANNELS_UPDATE', 'system_settings', `${data.channels.length} کانال`);
+    return NextResponse.json({ ok: true, message: 'تنظیمات عضویت اجباری کانال‌ها ذخیره شد.' });
+  }
+
+  if (data.action === 'update_bot_settings') {
+    db.prepare("INSERT OR REPLACE INTO system_settings (key, value_json, updated_at) VALUES ('bot_settings', ?, datetime('now'))").run(
+      JSON.stringify({
+        welcomeText: data.welcomeText.trim(),
+        requirePhoneContact: data.requirePhoneContact,
+        maintenanceMode: data.maintenanceMode,
+      })
+    );
+    writeAuditLog(adminActor, adminRole, 'BOT_SETTINGS_UPDATE', 'system_settings', `requirePhone=${data.requirePhoneContact}`);
+    return NextResponse.json({ ok: true, message: 'تنظیمات ربات ذخیره شد.' });
+  }
+
+  if (data.action === 'toggle_group_rule') {
+    const allowedColumns: Record<string, string> = {
+      anti_link: 'anti_link',
+      anti_ads: 'anti_ads',
+      anti_spam: 'anti_spam',
+      anti_flood: 'anti_flood',
+      anti_tabchi: 'anti_tabchi',
+      lock_media: 'lock_media',
+    };
+    const col = allowedColumns[data.field];
+    db.prepare(`UPDATE telegram_groups SET ${col} = ? WHERE id = ?`).run(data.enabled ? 1 : 0, data.groupId);
+    writeAuditLog(adminActor, adminRole, 'GROUP_RULE_TOGGLE', `group:${data.groupId}`, `${col}=${data.enabled}`);
+    return NextResponse.json({ ok: true, message: 'تنظیم گروه به‌روزرسانی شد.' });
+  }
+
+  if (data.action === 'cleanup_stale_rooms') {
+    const res = db.prepare("DELETE FROM engine_rooms WHERE expires_at < datetime('now') OR status = 'finished'").run();
+    writeAuditLog(adminActor, adminRole, 'ROOMS_CLEANUP', 'engine_rooms', `${res.changes} اتاق پاک شد`);
+    return NextResponse.json({ ok: true, message: `${res.changes} اتاق قدیمی و پایان‌یافته پاک‌سازی شد.` });
+  }
+
+  if (data.action === 'clear_error_logs') {
+    db.prepare('DELETE FROM system_error_logs').run();
+    writeAuditLog(adminActor, adminRole, 'CLEAR_ERROR_LOGS', 'system_error_logs');
+    return NextResponse.json({ ok: true, message: 'گزارش خطاها پاک شد.' });
+  }
+
+  if (data.action === 'add_delegated_admin' || data.action === 'remove_delegated_admin') {
+    if (!authority.isPrimaryAdmin) {
+      return NextResponse.json({ error: 'فقط مدیر اصلی مجاز به مدیریت دسترسی ادمین‌ها است.' }, { status: 403 });
+    }
+    const list = getDelegatedAdmins();
+    let updated: DelegatedAdminEntry[];
+    if (data.action === 'add_delegated_admin') {
+      updated = [
+        ...list.filter((item) => item.telegramId !== data.telegramId),
+        {
+          telegramId: data.telegramId,
+          label: data.label.trim(),
+          role: data.role,
+          addedAt: new Date().toISOString(),
+        },
+      ];
+      writeAuditLog(adminActor, adminRole, 'ADMIN_ADD', `tg:${data.telegramId}`, `${data.label} (${data.role})`);
+    } else {
+      updated = list.filter((item) => item.telegramId !== data.telegramId);
+      writeAuditLog(adminActor, adminRole, 'ADMIN_REMOVE', `tg:${data.telegramId}`);
+    }
+    db.prepare("INSERT OR REPLACE INTO system_settings (key, value_json, updated_at) VALUES ('delegated_admins', ?, datetime('now'))").run(
+      JSON.stringify(updated)
+    );
+    return NextResponse.json({ ok: true, delegatedAdmins: updated, message: 'فهرست دسترسی ادمین‌ها به‌روز شد.' });
   }
 
   return NextResponse.json({ error: 'عملیات ناشناخته' }, { status: 400 });

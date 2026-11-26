@@ -7,42 +7,41 @@ import {
   GroupModerationRules,
   ModerationSensitivity,
 } from '@/lib/moderation-engine';
-
-async function callTelegramApi(method: string, payload: Record<string, unknown>): Promise<boolean> {
-  const token = process.env.TELEGRAM_BOT_TOKEN?.trim();
-  if (!token) return false;
-  try {
-    const res = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-      signal: AbortSignal.timeout(6000),
-    });
-    const json = (await res.json().catch(() => null)) as { ok?: boolean } | null;
-    return Boolean(res.ok && json?.ok);
-  } catch {
-    return false;
-  }
-}
+import { logSystemError, normalizeTelegramPhone } from '@/lib/security';
+import {
+  callTelegramBot,
+  getBotUsername,
+  upsertTelegramUser,
+  verifyForcedChannelMembership,
+} from '@/lib/telegram-bot';
 
 async function sendTelegramMessage(chatId: number | string, text: string, replyMarkup?: Record<string, unknown>) {
-  await callTelegramApi('sendMessage', {
+  await callTelegramBot('sendMessage', {
     chat_id: chatId,
     text,
     ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
   });
 }
 
+async function answerCallback(callbackQueryId: string, text?: string, showAlert = false) {
+  await callTelegramBot('answerCallbackQuery', {
+    callback_query_id: callbackQueryId,
+    ...(text ? { text } : {}),
+    show_alert: showAlert,
+  });
+}
+
 async function deleteTelegramMessage(chatId: number | string, messageId: number): Promise<boolean> {
-  return callTelegramApi('deleteMessage', {
+  const res = await callTelegramBot('deleteMessage', {
     chat_id: chatId,
     message_id: messageId,
   });
+  return res.ok;
 }
 
 async function restrictTelegramMember(chatId: number | string, userId: number, muteMinutes: number): Promise<boolean> {
   const untilDate = Math.floor(Date.now() / 1000) + Math.max(1, muteMinutes) * 60;
-  return callTelegramApi('restrictChatMember', {
+  const res = await callTelegramBot('restrictChatMember', {
     chat_id: chatId,
     user_id: userId,
     until_date: untilDate,
@@ -55,40 +54,123 @@ async function restrictTelegramMember(chatId: number | string, userId: number, m
       can_send_other_messages: false,
     },
   });
+  return res.ok;
 }
 
 async function isTelegramGroupAdmin(chatId: number | string, userId: number): Promise<boolean> {
-  const token = process.env.TELEGRAM_BOT_TOKEN?.trim();
-  if (!token) return false;
-  try {
-    const res = await fetch(
-      `https://api.telegram.org/bot${token}/getChatMember?chat_id=${encodeURIComponent(String(chatId))}&user_id=${userId}`,
-      { signal: AbortSignal.timeout(5000) }
-    );
-    const data = (await res.json().catch(() => null)) as { ok?: boolean; result?: { status?: string } } | null;
-    const st = data?.result?.status;
-    return Boolean(data?.ok && (st === 'creator' || st === 'administrator'));
-  } catch {
-    return false;
-  }
+  const res = await callTelegramBot<{ status?: string }>('getChatMember', {
+    chat_id: chatId,
+    user_id: userId,
+  });
+  const st = res.result?.status;
+  return Boolean(res.ok && (st === 'creator' || st === 'administrator'));
 }
 
-function buildStartKeyboard(appUrl: string) {
+function getBotSettings(): { welcomeText: string; requirePhoneContact: boolean } {
+  try {
+    const db = getDb();
+    const row = db.prepare("SELECT value_json FROM system_settings WHERE key = 'bot_settings'").get() as
+      | { value_json: string }
+      | undefined;
+    if (row) {
+      const parsed = JSON.parse(row.value_json);
+      return {
+        welcomeText: String(parsed.welcomeText || 'به مدار خوش آمدی.'),
+        requirePhoneContact: parsed.requirePhoneContact !== false,
+      };
+    }
+  } catch {
+    // default below
+  }
+  return { welcomeText: 'به مدار خوش آمدی.', requirePhoneContact: true };
+}
+
+function buildForcedChannelsKeyboard(channels: { title: string; inviteUrl: string; joined: boolean }[]) {
+  const missing = channels.filter((c) => !c.joined);
+  const rows: Record<string, unknown>[][] = missing.map((ch) => [
+    { text: `عضویت در ${ch.title}`, url: ch.inviteUrl },
+  ]);
+  rows.push([{ text: 'بررسی عضویت', callback_data: 'madar_check_channels' }]);
+  return { inline_keyboard: rows };
+}
+
+function buildContactStepKeyboard(appUrl: string) {
+  const cleanUrl = appUrl.replace(/\/$/, '');
+  return {
+    inline_keyboard: [
+      [{ text: 'اشتراک‌گذاری شماره', web_app: { url: `${cleanUrl}?onboarding=contact` } }],
+    ],
+  };
+}
+
+function buildEnterMadarKeyboard(appUrl: string) {
   const cleanUrl = appUrl.replace(/\/$/, '');
   return {
     inline_keyboard: [
       [{ text: 'ورود به مدار', web_app: { url: cleanUrl } }],
       [
         { text: 'بازی‌ها و دورهمی', web_app: { url: `${cleanUrl}?tab=games` } },
-        { text: 'ونوس و Blind Date', web_app: { url: `${cleanUrl}?tab=venus` } },
+        { text: 'ونوس', web_app: { url: `${cleanUrl}?tab=venus` } },
       ],
       [
         { text: 'نجوای ناشناس', web_app: { url: `${cleanUrl}?tab=whisper` } },
         { text: 'پروفایل من', web_app: { url: `${cleanUrl}?tab=profile` } },
       ],
-      [{ text: 'راهنما', callback_data: 'madar_help' }],
     ],
   };
+}
+
+/**
+ * Evaluates forced channel membership -> phone contact step -> full entry for private chat user.
+ */
+async function advancePrivateOnboarding(
+  chatId: number,
+  tgUserId: number,
+  firstName: string,
+  appUrl: string,
+  extraNote = ''
+): Promise<{ step: 'channels_required' | 'contact_required' | 'ready'; channels?: unknown }> {
+  const db = getDb();
+  const membership = await verifyForcedChannelMembership(tgUserId);
+
+  if (!membership.allJoined) {
+    await sendTelegramMessage(
+      chatId,
+      `سلام ${firstName}!\nبرای ورود به مدار، ابتدا عضو کانال‌های زیر شو و سپس روی «بررسی عضویت» بزن.`,
+      buildForcedChannelsKeyboard(membership.channels)
+    );
+    return { step: 'channels_required', channels: membership.channels };
+  }
+
+  db.prepare("UPDATE users SET channel_verified_at = datetime('now') WHERE telegram_id = ?").run(String(tgUserId));
+
+  const userRow = db
+    .prepare('SELECT phone_verified, onboarding_completed FROM users WHERE telegram_id = ? AND is_deleted = 0')
+    .get(String(tgUserId)) as { phone_verified: number; onboarding_completed: number } | undefined;
+
+  const botSettings = getBotSettings();
+  const phoneAlreadyVerified = Boolean(userRow?.phone_verified);
+
+  if (botSettings.requirePhoneContact && !phoneAlreadyVerified) {
+    await sendTelegramMessage(
+      chatId,
+      `عضویت شما تأیید شد.\nبرای تکمیل ورود به مدار، دکمه «اشتراک‌گذاری شماره» را بزنید تا پنجره رسمی تلگرام باز شود.`,
+      buildContactStepKeyboard(appUrl)
+    );
+    return { step: 'contact_required' };
+  }
+
+  if (!userRow?.onboarding_completed) {
+    db.prepare('UPDATE users SET onboarding_completed = 1 WHERE telegram_id = ?').run(String(tgUserId));
+  }
+
+  const welcomeBase = botSettings.welcomeText || 'به مدار خوش آمدی.';
+  await sendTelegramMessage(
+    chatId,
+    `سلام ${firstName}! ${welcomeBase}${extraNote}`,
+    buildEnterMadarKeyboard(appUrl)
+  );
+  return { step: 'ready' };
 }
 
 export async function POST(req: NextRequest) {
@@ -97,6 +179,7 @@ export async function POST(req: NextRequest) {
   const isProd = process.env.NODE_ENV === 'production';
 
   if (isProd && !expectedSecret) {
+    logSystemError('telegram_webhook', 'TELEGRAM_WEBHOOK_SECRET missing in production');
     return NextResponse.json({ error: 'Webhook unavailable' }, { status: 503 });
   }
 
@@ -117,14 +200,41 @@ export async function POST(req: NextRequest) {
   const callbackQuery = update.callback_query;
   const message = update.message;
   const appUrl = (process.env.APP_URL || 'https://example.com').replace(/\/$/, '');
-  const botUsername = (process.env.TELEGRAM_BOT_USERNAME || 'MadarBot').toLowerCase();
+  const botUsername = getBotUsername().toLowerCase();
 
-  // 1. Inline Keyboard callbacks
+  // 1. Inline Keyboard Callbacks
   if (callbackQuery?.data) {
     const cbData: string = String(callbackQuery.data);
-    const fromId = callbackQuery.from?.id;
-    const fromName: string = callbackQuery.from?.first_name || 'بازیکن';
+    const cbId: string | undefined = callbackQuery.id ? String(callbackQuery.id) : undefined;
+    const fromId: number | undefined = typeof callbackQuery.from?.id === 'number' ? callbackQuery.from.id : undefined;
+    const fromName: string = callbackQuery.from?.first_name || 'کاربر مدار';
     const db = getDb();
+
+    // Forced channel re-check button
+    if (cbData === 'madar_check_channels' && fromId) {
+      const chatId = callbackQuery.message?.chat?.id ?? fromId;
+      upsertTelegramUser({
+        id: fromId,
+        first_name: fromName,
+        last_name: callbackQuery.from?.last_name,
+        username: callbackQuery.from?.username,
+        language_code: callbackQuery.from?.language_code,
+      });
+
+      const membership = await verifyForcedChannelMembership(fromId);
+      if (!membership.allJoined) {
+        if (cbId) {
+          await answerCallback(cbId, 'هنوز عضو همه کانال‌ها نشده‌اید.', true);
+        }
+        return NextResponse.json({ ok: true, handled: 'check_channels', allJoined: false });
+      }
+
+      if (cbId) {
+        await answerCallback(cbId, 'عضویت شما تأیید شد.');
+      }
+      const res = await advancePrivateOnboarding(chatId, fromId, fromName, appUrl);
+      return NextResponse.json({ ok: true, handled: 'check_channels', allJoined: true, nextStep: res.step });
+    }
 
     if (cbData.startsWith('mafia_vote:')) {
       const [, roomCode, targetId] = cbData.split(':');
@@ -147,13 +257,11 @@ export async function POST(req: NextRequest) {
             roomCode
           );
           if (callbackQuery.message?.chat?.id) {
-            await sendTelegramMessage(
-              callbackQuery.message.chat.id,
-              `رأی ${fromName} برای «${target.name}» ثبت شد.`
-            );
+            await sendTelegramMessage(callbackQuery.message.chat.id, `رأی ${fromName} برای «${target.name}» ثبت شد.`);
           }
         }
       }
+      if (cbId) await answerCallback(cbId, 'رأی ثبت شد.');
       return NextResponse.json({ ok: true, handled: 'mafia_vote' });
     }
 
@@ -166,15 +274,8 @@ export async function POST(req: NextRequest) {
           inline_keyboard: [[{ text: 'باز کردن میز بازی', web_app: { url: `${appUrl}?tab=games` } }]],
         }
       );
+      if (cbId) await answerCallback(cbId);
       return NextResponse.json({ ok: true, handled: 'mafia_dm' });
-    }
-
-    if (cbData === 'madar_help' && fromId) {
-      await sendTelegramMessage(
-        fromId,
-        'راهنمای مدار:\n• از دکمه ورود به مدار برای بازی‌های دورهمی، آشنایی ونوس و نجوای ناشناس استفاده کنید.\n• در گروه‌ها سپر محلی ضدلینک، ضدتبلیغ، ضداسپم و ضدتبچی بدون نیاز به سرویس خارجی فعال است.'
-      );
-      return NextResponse.json({ ok: true, handled: 'help' });
     }
   }
 
@@ -186,27 +287,141 @@ export async function POST(req: NextRequest) {
     const fromId: number | undefined = typeof message.from?.id === 'number' ? message.from.id : undefined;
     const fromName: string = message.from?.first_name || 'کاربر مدار';
     const messageId: number | undefined = typeof message.message_id === 'number' ? message.message_id : undefined;
+    const isForwarded = Boolean(
+      message.forward_origin ||
+        message.forward_from ||
+        message.forward_from_chat ||
+        message.forward_sender_name ||
+        message.forward_date
+    );
 
-    if (chatType === 'private' && text.startsWith('/start')) {
+    // 2A. PRIVATE CHAT: Strict Verified Telegram Contact Handler
+    if (message.contact) {
+      if (chatType !== 'private') {
+        return NextResponse.json({ ok: true, rejected: 'contact_not_private_chat' });
+      }
+      if (!fromId || typeof message.contact.user_id !== 'number') {
+        await sendTelegramMessage(chatId, 'اطلاعات تماس معتبر نیست. فقط شماره متعلق به حساب خودتان پذیرفته می‌شود.');
+        return NextResponse.json({ ok: true, rejected: 'missing_contact_user_id' });
+      }
+      if (isForwarded) {
+        await sendTelegramMessage(chatId, 'ارسال شماره فورواردشده مجاز نیست. لطفاً فقط از دکمه رسمی «اشتراک‌گذاری شماره» استفاده کنید.');
+        return NextResponse.json({ ok: true, rejected: 'forwarded_contact' });
+      }
+      if (message.contact.user_id !== fromId) {
+        await sendTelegramMessage(chatId, 'فقط می‌توانید شماره متعلق به حساب تلگرام خودتان را به اشتراک بگذارید.');
+        return NextResponse.json({ ok: true, rejected: 'contact_user_mismatch' });
+      }
+
+      const normalizedPhone = normalizeTelegramPhone(String(message.contact.phone_number || ''));
+      if (!normalizedPhone) {
+        await sendTelegramMessage(chatId, 'قالب شماره دریافتی معتبر نبود. لطفاً دوباره از طریق دکمه «اشتراک‌گذاری شماره» اقدام کنید.');
+        return NextResponse.json({ ok: true, rejected: 'invalid_phone_format' });
+      }
+
+      // Ensure user record exists without overwriting MADAR profile data
+      const upserted = upsertTelegramUser({
+        id: fromId,
+        first_name: fromName,
+        last_name: message.from?.last_name,
+        username: message.from?.username,
+        language_code: message.from?.language_code,
+      });
+
+      if (upserted.isBanned) {
+        return NextResponse.json({ ok: true, rejected: 'user_banned' });
+      }
+
+      const db = getDb();
+      const current = db
+        .prepare('SELECT phone_verified FROM users WHERE id = ?')
+        .get(upserted.userId) as { phone_verified: number } | undefined;
+
+      // Save phone only once unless a future explicit change process is used
+      if (!current?.phone_verified) {
+        // Check channel membership first before completing onboarding
+        const membership = await verifyForcedChannelMembership(fromId);
+        if (!membership.allJoined) {
+          await sendTelegramMessage(
+            chatId,
+            'ابتدا عضو کانال‌های زیر شوید و سپس روی «بررسی عضویت» بزنید.',
+            buildForcedChannelsKeyboard(membership.channels)
+          );
+          return NextResponse.json({ ok: true, rejected: 'channels_not_joined' });
+        }
+
+        db.prepare(`
+          UPDATE users
+          SET phone = ?,
+              phone_verified = 1,
+              phone_shared_at = datetime('now'),
+              channel_verified_at = COALESCE(channel_verified_at, datetime('now')),
+              onboarding_completed = 1
+          WHERE id = ?
+        `).run(normalizedPhone, upserted.userId);
+      }
+
+      await sendTelegramMessage(chatId, 'شماره با موفقیت ثبت شد.', buildEnterMadarKeyboard(appUrl));
+      return NextResponse.json({ ok: true, handled: 'verified_contact', userId: upserted.userId });
+    }
+
+    // 2B. PRIVATE CHAT: /start Flow
+    if (chatType === 'private' && text.startsWith('/start') && fromId) {
       const payload = text.split(' ')[1] || '';
+      const referralCode = payload.startsWith('ref_') ? payload : undefined;
+
+      const upserted = upsertTelegramUser(
+        {
+          id: fromId,
+          first_name: fromName,
+          last_name: message.from?.last_name,
+          username: message.from?.username,
+          language_code: message.from?.language_code,
+        },
+        { referralCode }
+      );
+
+      if (upserted.isBanned) {
+        await sendTelegramMessage(chatId, 'دسترسی این حساب به مدار محدود شده است.');
+        return NextResponse.json({ ok: true, handled: 'start_banned' });
+      }
+
       let extraNote = '';
       if (payload.startsWith('ref_')) {
-        extraNote = `\nکد دعوت ${payload} ثبت شد.`;
+        extraNote = '\nدعوت شما ثبت شد.';
       } else if (payload.startsWith('anon_')) {
-        extraNote = `\nبرای ارسال نجوای ناشناس به @${payload.slice(5)} وارد مدار شو.`;
+        extraNote = '\nبرای ارسال نجوای ناشناس وارد مدار شوید.';
       } else if (payload.startsWith('room_')) {
         extraNote = `\nاتاق بازی ${payload.slice(5)} آماده است.`;
       }
 
-      const welcome = `سلام ${fromName}! به مدار خوش آمدی.${extraNote}`;
-      await sendTelegramMessage(chatId, welcome, buildStartKeyboard(appUrl));
-      return NextResponse.json({ ok: true, handled: 'start' });
+      const res = await advancePrivateOnboarding(chatId, fromId, fromName, appUrl, extraNote);
+      return NextResponse.json({ ok: true, handled: 'start', step: res.step });
     }
 
+    // 2C. PRIVATE CHAT: Reject manually typed phone numbers
+    if (chatType === 'private' && fromId && text && !text.startsWith('/')) {
+      const looksLikePhone = /^\+?[0-9۰-۹\s\-()]{8,18}$/.test(text);
+      if (looksLikePhone) {
+        const db = getDb();
+        const u = db.prepare('SELECT phone_verified FROM users WHERE telegram_id = ?').get(String(fromId)) as
+          | { phone_verified: number }
+          | undefined;
+        if (!u?.phone_verified) {
+          await sendTelegramMessage(
+            chatId,
+            'واردکردن دستی شماره مجاز نیست. لطفاً فقط از دکمه رسمی «اشتراک‌گذاری شماره» استفاده کنید.',
+            buildContactStepKeyboard(appUrl)
+          );
+          return NextResponse.json({ ok: true, rejected: 'manual_phone_text' });
+        }
+      }
+    }
+
+    // 2D. GROUP / SUPERGROUP: Local Moderation Engine & /mafia
     if (chatType === 'group' || chatType === 'supergroup') {
       const db = getDb();
 
-      // Register group automatically if bot receives messages in a new group
       let grp = db.prepare('SELECT * FROM telegram_groups WHERE chat_id = ?').get(String(chatId)) as
         | (GroupModerationRules & {
             id: number;
@@ -250,13 +465,11 @@ export async function POST(req: NextRequest) {
         const hasMedia = Boolean(
           message.photo || message.video || message.document || message.sticker || message.animation || message.voice
         );
-        const isForwarded = Boolean(message.forward_origin || message.forward_from || message.forward_from_chat);
         const entities = Array.isArray(message.entities) ? message.entities : [];
         const mentionCount = entities.filter(
           (e: { type?: string }) => e?.type === 'mention' || e?.type === 'text_mention'
         ).length;
 
-        // Skip moderation enforcement on real group admins
         const senderIsAdmin = fromId ? await isTelegramGroupAdmin(chatId, fromId) : false;
 
         if (!senderIsAdmin) {

@@ -493,6 +493,14 @@ function initSchema(db: Database.Database) {
       FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
     );
 
+    CREATE TABLE IF NOT EXISTS system_error_logs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      source TEXT NOT NULL,
+      message TEXT NOT NULL,
+      details TEXT DEFAULT '',
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
     CREATE INDEX IF NOT EXISTS idx_sessions_token ON user_sessions(token_hash);
     CREATE INDEX IF NOT EXISTS idx_likes_to ON likes(to_user_id);
     CREATE INDEX IF NOT EXISTS idx_whispers_recipient ON whispers(recipient_user_id);
@@ -503,6 +511,36 @@ function initSchema(db: Database.Database) {
     CREATE INDEX IF NOT EXISTS idx_taste_user ON user_taste_signals(user_id);
     CREATE INDEX IF NOT EXISTS idx_blind_dates_users ON blind_dates(user_a_id, user_b_id);
   `);
+
+  // Safe additive column migrations for users (preserves all existing users & MADAR data)
+  const userCols = db.prepare('PRAGMA table_info(users)').all() as { name: string }[];
+  const hasUserCol = (col: string) => userCols.some((c) => c.name === col);
+  if (!hasUserCol('telegram_first_name')) db.exec('ALTER TABLE users ADD COLUMN telegram_first_name TEXT');
+  if (!hasUserCol('telegram_last_name')) db.exec('ALTER TABLE users ADD COLUMN telegram_last_name TEXT');
+  if (!hasUserCol('telegram_username')) db.exec('ALTER TABLE users ADD COLUMN telegram_username TEXT');
+  if (!hasUserCol('telegram_photo_url')) db.exec('ALTER TABLE users ADD COLUMN telegram_photo_url TEXT');
+  if (!hasUserCol('telegram_language_code')) db.exec('ALTER TABLE users ADD COLUMN telegram_language_code TEXT');
+  if (!hasUserCol('last_login_at')) db.exec('ALTER TABLE users ADD COLUMN last_login_at TEXT');
+  if (!hasUserCol('onboarding_completed')) {
+    db.exec('ALTER TABLE users ADD COLUMN onboarding_completed INTEGER NOT NULL DEFAULT 0');
+    // Existing users who already had phone_verified = 1 remain completed without re-asking phone
+    db.exec('UPDATE users SET onboarding_completed = 1 WHERE phone_verified = 1');
+  }
+  if (!hasUserCol('channel_verified_at')) db.exec('ALTER TABLE users ADD COLUMN channel_verified_at TEXT');
+  if (!hasUserCol('phone_shared_at')) db.exec('ALTER TABLE users ADD COLUMN phone_shared_at TEXT');
+
+  // Ensure default bot/channel/system settings exist without overwriting admin changes
+  const ensureSetting = db.prepare('INSERT OR IGNORE INTO system_settings (key, value_json) VALUES (?, ?)');
+  ensureSetting.run('forced_channels', JSON.stringify([]));
+  ensureSetting.run('delegated_admins', JSON.stringify([]));
+  ensureSetting.run(
+    'bot_settings',
+    JSON.stringify({
+      welcomeText: 'به مدار خوش آمدی.',
+      requirePhoneContact: true,
+      maintenanceMode: false,
+    })
+  );
 
   // Safe additive column migrations for telegram_groups (preserves all existing group configs)
   const groupCols = db.prepare('PRAGMA table_info(telegram_groups)').all() as { name: string }[];

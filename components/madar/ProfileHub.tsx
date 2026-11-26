@@ -1,20 +1,20 @@
 'use client';
 
 import React, { useCallback, useEffect, useState } from 'react';
+import Image from 'next/image';
 import {
   Award,
   Brain,
   CheckCircle2,
-  KeyRound,
   LogOut,
   Phone,
+  Send,
   ShieldCheck,
   Sparkles,
   Trash2,
   UserCheck,
   Users,
 } from 'lucide-react';
-import { initTelegramMiniApp } from '@/lib/telegram-webapp';
 import type { PersonalityQuestionDef } from '@/lib/personality-data';
 import type { MadarUser, UserSessionItem } from './types';
 
@@ -23,7 +23,6 @@ interface ProfileHubProps {
   user: MadarUser | null;
   sessions: UserSessionItem[];
   currentSessionId: string | null;
-  onAuthSuccess: (token: string, sessionId: string) => Promise<void>;
   onRefreshUser: () => Promise<void>;
   onLogout: (scope: 'current' | 'others' | 'delete_account') => Promise<void>;
 }
@@ -33,24 +32,13 @@ export default function ProfileHub({
   user,
   sessions,
   currentSessionId,
-  onAuthSuccess,
   onRefreshUser,
   onLogout,
 }: ProfileHubProps) {
-  // Auth forms
-  const [authMode, setAuthMode] = useState<'login' | 'register'>('login');
-  const [username, setUsername] = useState('');
-  const [displayName, setDisplayName] = useState('');
-  const [password, setPassword] = useState('');
-  const [birthDateReg, setBirthDateReg] = useState('1998-06-15');
-  const [referralReg, setReferralReg] = useState('');
-  const [authError, setAuthError] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
-
-  // Profile Tabs when signed in
   const [profileTab, setProfileTab] = useState<'info' | 'personality' | 'security'>('info');
   const [notice, setNotice] = useState<string | null>(null);
   const [savingProfile, setSavingProfile] = useState(false);
+  const [avatarFailed, setAvatarFailed] = useState(false);
 
   // Editable Profile State
   const [syncedUserId, setSyncedUserId] = useState<number | null>(null);
@@ -65,11 +53,12 @@ export default function ProfileHub({
   const [hideCity, setHideCity] = useState(Boolean(user?.hide_city));
   const [hideOnline, setHideOnline] = useState(Boolean(user?.hide_online));
   const [allowWhispers, setAllowWhispers] = useState(user ? Boolean(user.allow_whispers) : true);
-  const [newPassword, setNewPassword] = useState('');
 
   // Separated Independent Venus Dating Profile State
   const [dpBio, setDpBio] = useState(user?.datingProfile?.datingBio || '');
-  const [dpLookingFor, setDpLookingFor] = useState(user?.datingProfile?.lookingFor || 'آشنایی جدی و گفت‌وگوی عمیق');
+  const [dpLookingFor, setDpLookingFor] = useState(
+    user?.datingProfile?.lookingFor || 'آشنایی جدی و گفت‌وگوی عمیق'
+  );
   const [dpGenderPref, setDpGenderPref] = useState<'all' | 'زن' | 'مرد'>(
     (user?.datingProfile?.genderPref as 'all' | 'زن' | 'مرد') || 'all'
   );
@@ -81,6 +70,7 @@ export default function ProfileHub({
 
   if (user && syncedUserId !== user.id) {
     setSyncedUserId(user.id);
+    setAvatarFailed(false);
     setEditDisplay(user.display_name);
     setEditCity(user.city || 'تهران');
     setEditGender(user.gender || 'unspecified');
@@ -98,16 +88,11 @@ export default function ProfileHub({
     setDpShowCity(user.datingProfile?.showCity ?? true);
   }
 
-  // OTP State
-  const [phoneInput, setPhoneInput] = useState('+98912');
-  const [otpCode, setOtpCode] = useState('');
-  const [otpRequested, setOtpRequested] = useState(false);
-  const [sandboxOtp, setSandboxOtp] = useState<string | null>(null);
-  const [smsProviderActive, setSmsProviderActive] = useState<boolean | null>(null);
-
   // Personality Test State
   const [questions, setQuestions] = useState<PersonalityQuestionDef[]>([]);
-  const [answers, setAnswers] = useState<Record<string, { value: number; label: string; includeInMatching: boolean }>>({});
+  const [answers, setAnswers] = useState<
+    Record<string, { value: number; label: string; includeInMatching: boolean }>
+  >({});
   const [completionPercent, setCompletionPercent] = useState(0);
   const [disclaimer, setDisclaimer] = useState('');
 
@@ -135,58 +120,6 @@ export default function ProfileHub({
       active = false;
     };
   }, [loadPersonality]);
-
-  async function handleAuthSubmit(e: React.FormEvent) {
-    e.preventDefault();
-    setAuthError(null);
-    setBusy(true);
-    try {
-      const payload =
-        authMode === 'login'
-          ? { mode: 'login', username, password }
-          : {
-              mode: 'register',
-              username,
-              displayName,
-              password,
-              birthDate: birthDateReg,
-              referralCode: referralReg || undefined,
-            };
-      const res = await fetch('/api/auth/session', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        setAuthError(data.error || 'ورود ناموفق بود.');
-        return;
-      }
-      await onAuthSuccess(data.token, data.currentSessionId);
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function handleTelegramLogin() {
-    setAuthError(null);
-    const tg = initTelegramMiniApp();
-    if (!tg.initData) {
-      setAuthError('ورود به مدار فقط از طریق Telegram Mini App امکان‌پذیر است.');
-      return;
-    }
-    const res = await fetch('/api/auth/session', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ mode: 'telegram', initData: tg.initData }),
-    });
-    const data = await res.json();
-    if (!res.ok) {
-      setAuthError(data.error);
-      return;
-    }
-    await onAuthSuccess(data.token, data.currentSessionId);
-  }
 
   async function saveProfile(e: React.FormEvent) {
     e.preventDefault();
@@ -274,55 +207,6 @@ export default function ProfileHub({
     if (res.ok) await onRefreshUser();
   }
 
-  async function saveNewPassword(e: React.FormEvent) {
-    e.preventDefault();
-    if (!token || newPassword.length < 6) {
-      setNotice('رمز عبور مستقل مدار باید حداقل ۶ کاراکتر باشد.');
-      return;
-    }
-    const res = await fetch('/api/profile', {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-      body: JSON.stringify({ newPassword }),
-    });
-    const data = await res.json();
-    setNotice(res.ok ? 'رمز عبور مستقل مدار با الگوریتم امن scrypt ذخیره شد.' : data.error);
-    if (res.ok) setNewPassword('');
-  }
-
-  async function requestOtp() {
-    if (!token) return;
-    const res = await fetch('/api/auth/otp', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-      body: JSON.stringify({ step: 'request', phone: phoneInput }),
-    });
-    const data = await res.json();
-    setNotice(data.message || data.error);
-    if (res.ok) {
-      setOtpRequested(true);
-      setSandboxOtp(data.sandboxOtpPreview || null);
-      setSmsProviderActive(typeof data.smsProviderActive === 'boolean' ? data.smsProviderActive : null);
-    }
-  }
-
-  async function verifyOtp() {
-    if (!token) return;
-    const res = await fetch('/api/auth/otp', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-      body: JSON.stringify({ step: 'verify', phone: phoneInput, code: otpCode }),
-    });
-    const data = await res.json();
-    setNotice(data.message || data.error);
-    if (res.ok) {
-      setOtpRequested(false);
-      setOtpCode('');
-      setSandboxOtp(null);
-      await onRefreshUser();
-    }
-  }
-
   async function savePersonalityAnswer(qId: string, val: number, includeInMatching: boolean) {
     if (!token) return;
     const res = await fetch('/api/personality', {
@@ -340,143 +224,38 @@ export default function ProfileHub({
     }
   }
 
-  // Shared mobile-safe input class: text-base on mobile prevents iOS/Telegram WebView zoom on focus!
+  // Shared mobile-safe input class: text-base on mobile prevents iOS/Telegram WebView zoom on focus
   const inputCls =
     'w-full min-w-0 max-w-full rounded-xl border border-[#23303E] bg-[#0E1621] px-3.5 py-2.5 text-base sm:text-sm text-white placeholder:text-slate-500 focus:border-[#38BDF8] focus:outline-none transition-colors';
 
   if (!token || !user) {
     return (
-      <div className="w-full max-w-xl mx-auto madar-glass rounded-3xl p-4 sm:p-8 space-y-5 overflow-x-clip">
-        <div className="space-y-1.5">
-          <p className="text-xs text-[#38BDF8]">حساب واحد تلگرام، مینی‌اپ و وب</p>
-          <h1 className="text-xl sm:text-2xl font-bold text-white">ورود یا ساخت حساب در مدار</h1>
-          <p className="text-xs text-slate-400 leading-relaxed">
-            رمز عبور مدار کاملاً مستقل از رمز حساب تلگرام شماست و با هش امن scrypt روی سرور نگهداری می‌شود.
-          </p>
+      <div className="w-full max-w-md mx-auto madar-glass rounded-3xl p-6 sm:p-8 space-y-4 text-center">
+        <div className="w-12 h-12 rounded-2xl bg-[#38bdf8]/15 border border-[#38bdf8]/35 mx-auto flex items-center justify-center">
+          <Send className="w-5 h-5 text-[#38bdf8]" />
         </div>
-
-        <div className="grid grid-cols-2 gap-1 p-1 bg-[#0E1621] border border-[#23303E] rounded-xl">
-          <button
-            type="button"
-            onClick={() => setAuthMode('login')}
-            className={`py-2.5 px-2 text-xs font-semibold rounded-lg min-h-[44px] transition-colors ${
-              authMode === 'login' ? 'bg-amber-400 text-slate-950' : 'text-slate-300 hover:text-white'
-            }`}
-          >
-            ورود با نام کاربری
-          </button>
-          <button
-            type="button"
-            onClick={() => setAuthMode('register')}
-            className={`py-2.5 px-2 text-xs font-semibold rounded-lg min-h-[44px] transition-colors ${
-              authMode === 'register' ? 'bg-amber-400 text-slate-950' : 'text-slate-300 hover:text-white'
-            }`}
-          >
-            ثبت‌نام (+۱۰۰ ستاره)
-          </button>
-        </div>
-
-        {authError && (
-          <div className="rounded-xl border border-rose-500/40 bg-rose-500/10 px-4 py-3 text-xs text-rose-200 leading-relaxed">
-            {authError}
-          </div>
-        )}
-
-        <form onSubmit={handleAuthSubmit} className="space-y-4">
-          <div className="space-y-1.5 min-w-0">
-            <label className="text-xs text-slate-300 block">نام کاربری اختصاصی مدار (انگلیسی)</label>
-            <input
-              type="text"
-              required
-              autoCapitalize="none"
-              autoCorrect="off"
-              value={username}
-              onChange={(e) => setUsername(e.target.value)}
-              placeholder="مثلاً ali_madar"
-              className={`${inputCls} dir-ltr text-left`}
-            />
-          </div>
-
-          {authMode === 'register' && (
-            <>
-              <div className="space-y-1.5 min-w-0">
-                <label className="text-xs text-slate-300 block">نام نمایشی</label>
-                <input
-                  type="text"
-                  required
-                  value={displayName}
-                  onChange={(e) => setDisplayName(e.target.value)}
-                  placeholder="نام فارسی شما"
-                  className={inputCls}
-                />
-              </div>
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                <div className="space-y-1.5 min-w-0">
-                  <label className="text-xs text-slate-300 block">تاریخ تولد (احراز سن ۱۸+)</label>
-                  <input
-                    type="date"
-                    value={birthDateReg}
-                    onChange={(e) => setBirthDateReg(e.target.value)}
-                    className={`${inputCls} font-mono`}
-                  />
-                </div>
-                <div className="space-y-1.5 min-w-0">
-                  <label className="text-xs text-slate-300 block">کد معرف (اختیاری)</label>
-                  <input
-                    type="text"
-                    value={referralReg}
-                    onChange={(e) => setReferralReg(e.target.value)}
-                    placeholder="ref_..."
-                    className={`${inputCls} dir-ltr text-left`}
-                  />
-                </div>
-              </div>
-            </>
-          )}
-
-          <div className="space-y-1.5 min-w-0">
-            <label className="text-xs text-slate-300 block">رمز عبور مستقل مدار</label>
-            <input
-              type="password"
-              required
-              minLength={6}
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              placeholder="حداقل ۶ کاراکتر"
-              className={inputCls}
-            />
-          </div>
-
-          <button
-            type="submit"
-            disabled={busy}
-            className="w-full rounded-xl bg-amber-400 py-3 text-sm font-bold text-slate-950 hover:bg-amber-300 disabled:opacity-60 min-h-[48px] transition-colors"
-          >
-            {busy ? 'در حال بررسی...' : authMode === 'login' ? 'ورود به مدار' : 'تکمیل ثبت‌نام'}
-          </button>
-        </form>
-
-        <div className="pt-4 border-t border-[#23303E]">
-          <button
-            type="button"
-            onClick={handleTelegramLogin}
-            className="w-full rounded-xl border border-[#38BDF8]/40 bg-[#38BDF8]/10 px-3 py-2.5 text-xs font-semibold text-sky-200 hover:bg-[#38BDF8]/20 min-h-[44px]"
-          >
-            ورود مستقیم با امضای Telegram Mini App
-          </button>
-        </div>
+        <h1 className="text-lg font-bold text-white">ورود از طریق تلگرام</h1>
+        <p className="text-xs text-slate-400 leading-relaxed">
+          حساب کاربری مدار به صورت مستقیم از طریق ربات تلگرام متصل می‌شود.
+        </p>
       </div>
     );
   }
 
+  const showTelegramPhoto = Boolean(user.telegram_photo_url) && !avatarFailed;
+  const telegramFullName = [user.telegram_first_name, user.telegram_last_name]
+    .filter(Boolean)
+    .join(' ')
+    .trim();
+
   return (
     <div className="w-full max-w-full min-w-0 space-y-5 pb-6 overflow-x-clip">
-      {/* Cosmic Identity & Profile Header — Fully Mobile Safe (Zero Horizontal Overflow) */}
+      {/* Cosmic Identity & Telegram Synced Profile Header */}
       <section className="madar-glass rounded-3xl p-4 sm:p-6 space-y-5 overflow-hidden">
         <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 min-w-0">
           <div className="flex items-center gap-3.5 min-w-0">
             <div
-              className={`w-14 h-14 sm:w-16 sm:h-16 rounded-2xl flex items-center justify-center text-lg sm:text-xl font-bold text-white shrink-0 ${
+              className={`w-14 h-14 sm:w-16 sm:h-16 rounded-2xl flex items-center justify-center text-lg sm:text-xl font-bold text-white shrink-0 overflow-hidden ${
                 user.equipped_frame === 'frame_gold_orbit'
                   ? 'ring-2 ring-amber-400 ring-offset-2 ring-offset-[#0a1026]'
                   : user.equipped_frame === 'frame_neptune_halo'
@@ -485,26 +264,40 @@ export default function ProfileHub({
               }`}
               style={{ backgroundColor: user.avatar_color }}
             >
-              {user.avatar_initials}
+              {showTelegramPhoto ? (
+                <Image
+                  src={user.telegram_photo_url!}
+                  alt={user.display_name}
+                  width={64}
+                  height={64}
+                  referrerPolicy="no-referrer"
+                  onError={() => setAvatarFailed(true)}
+                  className="w-full h-full object-cover"
+                />
+              ) : (
+                user.avatar_initials
+              )}
             </div>
             <div className="min-w-0 flex-1">
               <h1 className="text-lg sm:text-xl font-bold text-white truncate">{user.display_name}</h1>
               <p className="text-xs text-slate-300 mt-1 break-words leading-relaxed">
-                <span className="font-mono text-cyan-300">@{user.username}</span> · سطح{' '}
-                <span className="font-mono tabular-nums text-amber-300">{user.level}</span> ·{' '}
-                {user.age ? `${user.age} ساله` : 'سن ثبت نشده'} · {user.hide_city ? 'شهر مخفی' : user.city}
-                {user.phone_verified ? ' · موبایل تأییدشده' : ' · موبایل تأییدنشده'}
+                <span className="font-mono text-cyan-300">
+                  @{user.telegram_username || user.username}
+                </span>{' '}
+                · سطح <span className="font-mono tabular-nums text-amber-300">{user.level}</span> ·{' '}
+                {user.age ? `${user.age} ساله` : 'سن ثبت نشده'} ·{' '}
+                {user.hide_city ? 'شهر مخفی' : user.city}
+                {user.phone_verified ? ' · شماره تأییدشده' : ''}
               </p>
             </div>
           </div>
 
-          {/* Touch-safe full-width scrollable tab bar (replaces broken w-fit overflow) */}
           <div className="w-full md:w-auto max-w-full madar-scroll-x">
             <div className="inline-flex items-center gap-1 p-1 bg-[#0E1621] border border-[#23303E] rounded-xl min-w-full sm:min-w-0">
               {[
                 { id: 'info', label: 'پروفایل و ونوس' },
                 { id: 'personality', label: `آزمون شخصیت (${completionPercent}%)` },
-                { id: 'security', label: 'امنیت و +۱۸' },
+                { id: 'security', label: 'حساب و +۱۸' },
               ].map((t) => (
                 <button
                   key={t.id}
@@ -523,7 +316,7 @@ export default function ProfileHub({
           </div>
         </div>
 
-        {/* Cosmic Identity Strip: Personal Star, Level, Badges & Constellation */}
+        {/* Cosmic Identity Strip */}
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5 pt-4 border-t border-[#23303E]">
           <div className="rounded-xl bg-[#0E1621] border border-[#23303E] p-3 min-w-0">
             <p className="text-[11px] text-slate-400 flex items-center gap-1">
@@ -570,9 +363,25 @@ export default function ProfileHub({
       {/* TAB 1: SEPARATED SOCIAL PROFILE & INDEPENDENT OPTIONAL DATING PROFILE */}
       {profileTab === 'info' && (
         <div className="space-y-6 min-w-0">
+          {/* Read-only Telegram synced identity summary */}
+          <div className="rounded-2xl border border-[#23303E] bg-[#17212B]/80 p-4 flex flex-wrap items-center justify-between gap-3 text-xs">
+            <div className="space-y-0.5 min-w-0">
+              <p className="text-slate-400">اطلاعات همگام‌شده از تلگرام</p>
+              <p className="text-slate-100 font-medium truncate">
+                {telegramFullName || user.display_name}
+                {user.telegram_username ? ` (@${user.telegram_username})` : ''}
+                {user.telegram_language_code ? ` · زبان: ${user.telegram_language_code}` : ''}
+              </p>
+            </div>
+            <span className="inline-flex items-center gap-1.5 text-emerald-300 font-semibold shrink-0">
+              <CheckCircle2 className="w-4 h-4" />
+              <span>متصل به تلگرام</span>
+            </span>
+          </div>
+
           <form onSubmit={saveProfile} className="madar-glass rounded-2xl p-4 sm:p-6 space-y-5 min-w-0">
             <div className="pb-3 border-b border-indigo-500/20">
-              <p className="text-xs text-cyan-300">بخش ۱ · همیشه فعال برای بازی‌ها، نجوا، گروه‌ها و کهکشان شخصی</p>
+              <p className="text-xs text-cyan-300">بخش ۱ · پروفایل اختصاصی شما در بازی‌ها، نجوا و منظومه</p>
               <h2 className="text-base sm:text-lg font-bold text-white mt-0.5">تکمیل و ویرایش پروفایل اجتماعی</h2>
             </div>
 
@@ -679,7 +488,6 @@ export default function ProfileHub({
               ))}
             </div>
 
-            {/* Keyboard-safe & Mobile-safe Submit Bar (never pushed off-screen) */}
             <div className="sticky bottom-16 md:bottom-3 z-20 -mx-4 sm:mx-0 px-4 sm:px-0 py-2.5 bg-[#17212B]/95 sm:bg-transparent border-t border-[#23303E] sm:border-0 flex justify-end">
               <button
                 type="submit"
@@ -857,7 +665,7 @@ export default function ProfileHub({
         </div>
       )}
 
-      {/* TAB 3: PHONE +98 OTP, STRICT 18+ VERIFICATION GATE, PASSWORD & SESSIONS */}
+      {/* TAB 3: READ-ONLY TELEGRAM ACCOUNT STATUS, 18+ GATE & SESSIONS (ZERO PASSWORD / ZERO OTP) */}
       {profileTab === 'security' && (
         <div className="space-y-6 min-w-0">
           {/* Dedicated Multi-Layer 18+ Verification & Consent Gate */}
@@ -887,18 +695,18 @@ export default function ProfileHub({
                 </p>
               </div>
               <div className="rounded-xl border border-indigo-500/20 bg-[#050816] p-3.5 space-y-1">
-                <p className="text-slate-400">لایه ۲ · احراز شماره ایران</p>
+                <p className="text-slate-400">لایه ۲ · تأیید شماره تلگرام</p>
                 <p className={user.phone_verified ? 'text-emerald-300 font-semibold' : 'text-amber-300 font-semibold'}>
-                  {user.phone_verified ? 'شماره +98 با OTP تأیید شده' : 'نیازمند تأیید شماره در کادر پایین'}
+                  {user.phone_verified ? 'شماره از طریق تلگرام تأیید شده' : 'در مرحله ورود تلگرام تأیید می‌شود'}
                 </p>
               </div>
               <div className="rounded-xl border border-indigo-500/20 bg-[#050816] p-3.5 space-y-1">
                 <p className="text-slate-400">لایه ۳ · رضایت صریح + بررسی</p>
                 <p className={user.isAdultVerified ? 'text-emerald-300 font-semibold' : 'text-cyan-300 font-semibold'}>
                   {user.isAdultVerified
-                    ? 'تأیید نهایی مدیریت انجام شده'
+                    ? 'تأیید نهایی انجام شده'
                     : user.adultVerification?.status === 'pending_review'
-                      ? 'در انتظار تأیید پنل مدیریت'
+                      ? 'در انتظار بررسی'
                       : 'نیازمند ثبت رضایت‌نامه آگاهانه'}
                 </p>
               </div>
@@ -952,139 +760,79 @@ export default function ProfileHub({
           </section>
 
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 min-w-0">
-            {/* Phone +98 OTP Verification */}
+            {/* Read-only Telegram Account & Phone Verification Status (NEVER asks for phone again) */}
             <div className="madar-glass rounded-2xl p-4 sm:p-6 space-y-4 min-w-0">
               <div className="flex items-center gap-2 text-base font-bold text-white">
                 <Phone className="w-4 h-4 text-emerald-400 shrink-0" />
-                <span>تأیید شماره موبایل ایران (+98 OTP)</span>
+                <span>وضعیت احراز هویت تلگرام</span>
               </div>
               <p className="text-xs text-slate-400 leading-relaxed">
-                شماره موبایل شما صرفاً برای امنیت حساب، ضدتقلب و لایه دوم احراز هویت است و هرگز به کاربران دیگر نمایش داده نمی‌شود.
-                {user.phoneMasked && ` شماره ثبت‌شده: ${user.phoneMasked}`}
+                ورود شما بدون نیاز به رمز عبور و به‌صورت مستقیم از طریق حساب تلگرام انجام می‌شود. شماره تلگرام فقط یک‌بار هنگام ورود اولیه ثبت می‌شود و برای سایر کاربران کاملاً مخفی است.
               </p>
 
-              <div className="flex flex-col sm:flex-row gap-2.5">
-                <input
-                  type="tel"
-                  value={phoneInput}
-                  onChange={(e) => setPhoneInput(e.target.value)}
-                  placeholder="+989123456789"
-                  className={`${inputCls} flex-1 font-mono dir-ltr text-left`}
-                />
-                <button
-                  type="button"
-                  onClick={requestOtp}
-                  className="w-full sm:w-auto rounded-xl bg-amber-400 px-4 py-2.5 text-xs font-semibold text-slate-950 whitespace-nowrap shrink-0 min-h-[46px]"
-                >
-                  ارسال کد OTP
-                </button>
-              </div>
-
-              {otpRequested && (
-                <div className="space-y-2.5 pt-2 border-t border-[#23303E]">
-                  {smsProviderActive === true && (
-                    <p className="text-xs text-emerald-300">
-                      کد تأیید از طریق درگاه پیامک برای شماره شما ارسال شد.
-                    </p>
-                  )}
-                  {sandboxOtp && (
-                    <p className="text-xs text-sky-300 font-mono break-all">
-                      کد محیط توسعه (فقط حالت Development): <strong>{sandboxOtp}</strong>
-                    </p>
-                  )}
-                  <div className="flex flex-col sm:flex-row gap-2.5">
-                    <input
-                      type="text"
-                      inputMode="numeric"
-                      maxLength={6}
-                      value={otpCode}
-                      onChange={(e) => setOtpCode(e.target.value)}
-                      placeholder="کد ۶ رقمی"
-                      className={`${inputCls} flex-1 font-mono text-center tracking-widest`}
-                    />
-                    <button
-                      type="button"
-                      onClick={verifyOtp}
-                      className="w-full sm:w-auto inline-flex items-center justify-center gap-1.5 rounded-xl bg-emerald-400 px-4 py-2.5 text-xs font-semibold text-slate-950 min-h-[46px]"
-                    >
-                      <CheckCircle2 className="w-4 h-4 shrink-0" />
-                      <span>تأیید شماره</span>
-                    </button>
-                  </div>
+              <div className="space-y-2.5 text-xs">
+                <div className="flex items-center justify-between rounded-xl border border-[#23303E] bg-[#0E1621] px-4 py-3">
+                  <span className="text-slate-400">اتصال حساب تلگرام</span>
+                  <span className="text-emerald-300 font-semibold">فعال و تأییدشده</span>
                 </div>
-              )}
+                <div className="flex items-center justify-between rounded-xl border border-[#23303E] bg-[#0E1621] px-4 py-3">
+                  <span className="text-slate-400">وضعیت شماره تلگرام</span>
+                  <span className={user.phone_verified ? 'text-emerald-300 font-semibold' : 'text-amber-300 font-semibold'}>
+                    {user.phone_verified ? 'ثبت و تأییدشده (محفوظ)' : 'تأییدنشده'}
+                  </span>
+                </div>
+                {user.last_login_at && (
+                  <div className="flex items-center justify-between rounded-xl border border-[#23303E] bg-[#0E1621] px-4 py-3">
+                    <span className="text-slate-400">آخرین ورود</span>
+                    <span className="font-mono text-slate-300">{user.last_login_at.slice(0, 16)}</span>
+                  </div>
+                )}
+              </div>
             </div>
 
-            {/* Independent MADAR Password & Sessions */}
-            <div className="madar-glass rounded-2xl p-4 sm:p-6 space-y-5 min-w-0">
-              <form onSubmit={saveNewPassword} className="space-y-3">
-                <div className="flex items-center gap-2 text-base font-bold text-white">
-                  <KeyRound className="w-4 h-4 text-amber-400 shrink-0" />
-                  <span>تغییر رمز عبور مستقل مدار</span>
+            {/* Active Sessions & Account Controls */}
+            <div className="madar-glass rounded-2xl p-4 sm:p-6 space-y-4 min-w-0">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="flex items-center gap-2 text-sm font-bold text-white">
+                  <ShieldCheck className="w-4 h-4 text-cyan-400 shrink-0" />
+                  <span>نشست‌های فعال ({sessions.length})</span>
                 </div>
-                <p className="text-xs text-slate-400 leading-relaxed">
-                  هرگز رمز حساب اصلی تلگرام را وارد نکنید؛ این رمز فقط برای ورود مستقل به وب مدار است.
-                </p>
-                <div className="flex flex-col sm:flex-row gap-2.5">
-                  <input
-                    type="password"
-                    value={newPassword}
-                    onChange={(e) => setNewPassword(e.target.value)}
-                    placeholder="رمز عبور جدید (حداقل ۶ کاراکتر)"
-                    className={`${inputCls} flex-1`}
-                  />
-                  <button
-                    type="submit"
-                    className="w-full sm:w-auto rounded-xl border border-amber-400/50 bg-amber-400/10 px-4 py-2.5 text-xs font-semibold text-amber-200 hover:bg-amber-400 hover:text-slate-950 min-h-[46px]"
-                  >
-                    ذخیره رمز
-                  </button>
-                </div>
-              </form>
-
-              <div className="pt-4 border-t border-indigo-500/20 space-y-3">
-                <div className="flex flex-wrap items-center justify-between gap-2">
-                  <div className="flex items-center gap-2 text-sm font-bold text-white">
-                    <ShieldCheck className="w-4 h-4 text-cyan-400 shrink-0" />
-                    <span>نشست‌های فعال ({sessions.length})</span>
+                <button
+                  type="button"
+                  onClick={() => onLogout('others')}
+                  className="text-xs text-amber-300 hover:text-amber-200 min-h-[36px]"
+                >
+                  خروج از سایر نشست‌ها
+                </button>
+              </div>
+              <div className="divide-y divide-indigo-500/15 max-h-40 overflow-y-auto madar-scroll-y">
+                {sessions.map((s) => (
+                  <div key={s.id} className="py-2 text-xs flex items-center justify-between gap-2 text-slate-300">
+                    <span className="truncate">
+                      {s.device_label} {s.id === currentSessionId ? '(فعلی)' : ''}
+                    </span>
+                    <span className="font-mono text-[11px] text-slate-500 shrink-0">{s.created_at.slice(0, 10)}</span>
                   </div>
-                  <button
-                    type="button"
-                    onClick={() => onLogout('others')}
-                    className="text-xs text-amber-300 hover:text-amber-200 min-h-[36px]"
-                  >
-                    خروج از سایر نشست‌ها
-                  </button>
-                </div>
-                <div className="divide-y divide-indigo-500/15 max-h-36 overflow-y-auto madar-scroll-y">
-                  {sessions.map((s) => (
-                    <div key={s.id} className="py-2 text-xs flex items-center justify-between gap-2 text-slate-300">
-                      <span className="truncate">
-                        {s.device_label} {s.id === currentSessionId ? '(فعلی)' : ''}
-                      </span>
-                      <span className="font-mono text-[11px] text-slate-500 shrink-0">{s.created_at.slice(0, 10)}</span>
-                    </div>
-                  ))}
-                </div>
+                ))}
+              </div>
 
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 pt-3 border-t border-indigo-500/20">
-                  <button
-                    type="button"
-                    onClick={() => onLogout('current')}
-                    className="w-full inline-flex items-center justify-center gap-1.5 rounded-xl border border-slate-700 px-4 py-2.5 text-xs text-slate-200 hover:border-slate-500 min-h-[44px]"
-                  >
-                    <LogOut className="w-3.5 h-3.5 shrink-0" />
-                    <span>خروج از حساب</span>
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => onLogout('delete_account')}
-                    className="w-full inline-flex items-center justify-center gap-1.5 rounded-xl border border-rose-500/40 px-4 py-2.5 text-xs text-rose-300 hover:bg-rose-500/15 min-h-[44px]"
-                  >
-                    <Trash2 className="w-3.5 h-3.5 shrink-0" />
-                    <span>حذف کامل حساب</span>
-                  </button>
-                </div>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 pt-3 border-t border-indigo-500/20">
+                <button
+                  type="button"
+                  onClick={() => onLogout('current')}
+                  className="w-full inline-flex items-center justify-center gap-1.5 rounded-xl border border-slate-700 px-4 py-2.5 text-xs text-slate-200 hover:border-slate-500 min-h-[44px]"
+                >
+                  <LogOut className="w-3.5 h-3.5 shrink-0" />
+                  <span>خروج از حساب</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => onLogout('delete_account')}
+                  className="w-full inline-flex items-center justify-center gap-1.5 rounded-xl border border-rose-500/40 px-4 py-2.5 text-xs text-rose-300 hover:bg-rose-500/15 min-h-[44px]"
+                >
+                  <Trash2 className="w-3.5 h-3.5 shrink-0" />
+                  <span>حذف کامل حساب</span>
+                </button>
               </div>
             </div>
           </div>

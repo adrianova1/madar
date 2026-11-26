@@ -5,10 +5,25 @@ export type MainView =
   | 'whisper'
   | 'profile'
   | 'saturn'
-  | 'shop'
-  | 'admin';
+  | 'shop';
 
 export type GameSubTab = 'hangout' | 'hokm' | 'mafia' | 'quiz' | 'truth';
+
+export interface ForcedChannelStatus {
+  id: string;
+  chatId: string;
+  title: string;
+  inviteUrl: string;
+  joined: boolean;
+}
+
+export interface OnboardingState {
+  channelsVerified: boolean;
+  channels: ForcedChannelStatus[];
+  phoneShared: boolean;
+  needsContactShare: boolean;
+  onboardingCompleted: boolean;
+}
 
 export interface PlanetConfig {
   id: string;
@@ -68,6 +83,13 @@ export interface MadarUser {
   telegram_id: string | null;
   username: string;
   display_name: string;
+  telegram_first_name?: string | null;
+  telegram_last_name?: string | null;
+  telegram_username?: string | null;
+  telegram_photo_url?: string | null;
+  telegram_language_code?: string | null;
+  last_login_at?: string | null;
+  onboarding_completed?: number;
   phoneMasked: string | null;
   phone_verified: number;
   role: string;

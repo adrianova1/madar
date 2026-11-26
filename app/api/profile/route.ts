@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { z } from 'zod';
 import { getDb } from '@/lib/db';
-import { calculateAge, getAuthUser, hashPassword } from '@/lib/security';
+import { calculateAge, getAuthUser } from '@/lib/security';
 
 const ProfileUpdateSchema = z.object({
   displayName: z.string().min(2).max(40).optional(),
@@ -23,7 +23,6 @@ const ProfileUpdateSchema = z.object({
   datingEnabled: z.boolean().optional(),
   allowWhispers: z.boolean().optional(),
   usePersonalityInMatching: z.boolean().optional(),
-  newPassword: z.string().min(6).max(128).optional(),
   datingProfileAction: z.enum(['save', 'pause', 'resume', 'delete']).optional(),
   datingBio: z.string().max(260).optional(),
   lookingFor: z.string().max(80).optional(),
@@ -144,9 +143,6 @@ export async function PATCH(req: NextRequest) {
     }
     if (d.allowWhispers !== undefined) {
       db.prepare('UPDATE users SET allow_whispers = ? WHERE id = ?').run(d.allowWhispers ? 1 : 0, auth.id);
-    }
-    if (d.newPassword) {
-      db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(hashPassword(d.newPassword), auth.id);
     }
 
     const current = db.prepare('SELECT * FROM user_profiles WHERE user_id = ?').get(auth.id) as Record<string, unknown>;

@@ -1,45 +1,59 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { z } from 'zod';
-import crypto from 'crypto';
-import { getDb, adjustStarsAtomic } from '@/lib/db';
+import { getDb } from '@/lib/db';
 import {
   calculateAge,
   checkRateLimit,
   createSession,
   getAuthUser,
   getClientIp,
-  hashPassword,
-  verifyPassword,
+  isSessionSecretConfigured,
+  logSystemError,
+  resolveAdminAuthority,
   verifyTelegramInitData,
 } from '@/lib/security';
+import {
+  fetchTelegramAvatarProxyUrl,
+  getBotUsername,
+  getForcedChannels,
+  upsertTelegramUser,
+  verifyForcedChannelMembership,
+} from '@/lib/telegram-bot';
 
-const AuthActionSchema = z.discriminatedUnion('mode', [
-  z.object({
-    mode: z.literal('login'),
-    username: z.string().min(3).max(40),
-    password: z.string().min(6).max(128),
-  }),
-  z.object({
-    mode: z.literal('register'),
-    username: z.string().regex(/^[a-zA-Z0-9_]{3,28}$/, 'نام کاربری باید انگلیسی و بین ۳ تا ۲۸ کاراکتر باشد'),
-    displayName: z.string().min(2).max(40),
-    password: z.string().min(6).max(128),
-    birthDate: z.string().optional(),
-    city: z.string().max(40).optional(),
-    referralCode: z.string().max(32).optional(),
-  }),
-  z.object({
-    mode: z.literal('telegram'),
-    initData: z.string().min(1),
-    referralCode: z.string().max(32).optional(),
-  }),
-]);
+// Telegram Mini App initData is the ONLY authentication method for MADAR.
+// All password login, manual registration, email, and SMS OTP flows are removed.
+const TelegramAuthSchema = z.object({
+  mode: z.literal('telegram'),
+  initData: z.string().min(10, 'اطلاعات ورود تلگرام نامعتبر است.').max(8192),
+  referralCode: z.string().max(32).optional(),
+});
+
+function getBotSettings(): { welcomeText: string; requirePhoneContact: boolean; maintenanceMode: boolean } {
+  const db = getDb();
+  const row = db.prepare("SELECT value_json FROM system_settings WHERE key = 'bot_settings'").get() as
+    | { value_json: string }
+    | undefined;
+  if (!row) return { welcomeText: 'به مدار خوش آمدی.', requirePhoneContact: true, maintenanceMode: false };
+  try {
+    const parsed = JSON.parse(row.value_json);
+    return {
+      welcomeText: String(parsed.welcomeText || 'به مدار خوش آمدی.'),
+      requirePhoneContact: parsed.requirePhoneContact !== false,
+      maintenanceMode: Boolean(parsed.maintenanceMode),
+    };
+  } catch {
+    return { welcomeText: 'به مدار خوش آمدی.', requirePhoneContact: true, maintenanceMode: false };
+  }
+}
 
 function buildUserBundle(userId: number) {
   const db = getDb();
   const user = db
     .prepare(`
-      SELECT u.id, u.telegram_id, u.username, u.display_name, u.phone, u.phone_verified,
+      SELECT u.id, u.telegram_id, u.username, u.display_name, u.phone_verified,
+             u.telegram_first_name, u.telegram_last_name, u.telegram_username,
+             u.telegram_photo_url, u.telegram_language_code, u.last_login_at,
+             u.onboarding_completed, u.channel_verified_at, u.phone_shared_at,
              u.role, u.subscription_tier, u.level, u.xp, u.referral_code, u.anon_slug,
              u.allow_whispers, u.created_at,
              p.avatar_color, p.avatar_initials, p.gender, p.birth_date, p.city, p.province,
@@ -94,7 +108,6 @@ function buildUserBundle(userId: number) {
     db.prepare('SELECT COUNT(*) as c FROM game_history WHERE user_id = ?').get(userId) as { c: number }
   ).c;
 
-  // Separated Dating Profile (optional — users can join purely for games & social)
   const datingProfileRow = db
     .prepare(
       'SELECT is_active, dating_bio, looking_for, min_age, max_age, gender_pref, show_city, activated_at FROM dating_profiles WHERE user_id = ?'
@@ -112,7 +125,6 @@ function buildUserBundle(userId: number) {
       }
     | undefined;
 
-  // Multi-layer 18+ Verification (birthdate alone NEVER unlocks 18+)
   const adultRow = db
     .prepare('SELECT status, phone_confirmed, consent_accepted, reviewed_by, reviewed_at FROM adult_verifications WHERE user_id = ?')
     .get(userId) as
@@ -132,43 +144,14 @@ function buildUserBundle(userId: number) {
   const isAdultVerified =
     adultStatus === 'verified' && phoneVerified && birthDateOver18 && adultConsentAccepted;
 
-  // Personal Galaxy Earth Planet Evolution tied to XP, Stars, Referrals & Activity
   const totalStars = Number(user.free_stars || 0) + Number(user.paid_stars || 0);
   const xp = Number(user.xp || 0);
   const evolutionScore = xp + referralCount * 120 + gamesPlayedCount * 35 + Math.min(300, totalStars);
   const evolutionStages = [
-    {
-      stage: 1,
-      title: 'زمینِ نوبنیاد',
-      subtitle: 'هسته آرام کهکشان شخصی تو',
-      minScore: 0,
-      ringAccent: '#38bdf8',
-      auraStyle: 'atmosphere',
-    },
-    {
-      stage: 2,
-      title: 'زمینِ درخشان',
-      subtitle: 'شفق آبی و اولین حلقه مداری فعال',
-      minScore: 300,
-      ringAccent: '#22d3ee',
-      auraStyle: 'aurora',
-    },
-    {
-      stage: 3,
-      title: 'زمینِ اسطرلابی',
-      subtitle: 'حلقه طلایی دوگانه و منظومه اجتماعی پویا',
-      minScore: 700,
-      ringAccent: '#eab308',
-      auraStyle: 'astrolabe',
-    },
-    {
-      stage: 4,
-      title: 'کهکشانِ فرمانروا',
-      subtitle: 'تاج کیهانی کامل با ستارگان و همراهان مداری',
-      minScore: 1300,
-      ringAccent: '#f59e0b',
-      auraStyle: 'sovereign',
-    },
+    { stage: 1, title: 'زمینِ نوبنیاد', subtitle: 'هسته آرام کهکشان شخصی تو', minScore: 0, ringAccent: '#38bdf8', auraStyle: 'atmosphere' },
+    { stage: 2, title: 'زمینِ درخشان', subtitle: 'شفق آبی و اولین حلقه مداری فعال', minScore: 300, ringAccent: '#22d3ee', auraStyle: 'aurora' },
+    { stage: 3, title: 'زمینِ اسطرلابی', subtitle: 'حلقه طلایی دوگانه و منظومه اجتماعی پویا', minScore: 700, ringAccent: '#eab308', auraStyle: 'astrolabe' },
+    { stage: 4, title: 'کهکشانِ فرمانروا', subtitle: 'تاج کیهانی کامل با ستارگان و همراهان مداری', minScore: 1300, ringAccent: '#f59e0b', auraStyle: 'sovereign' },
   ];
   let currentStage = evolutionStages[0];
   let nextStage: (typeof evolutionStages)[number] | null = evolutionStages[1];
@@ -179,16 +162,9 @@ function buildUserBundle(userId: number) {
     }
   }
   const progressPercent = nextStage
-    ? Math.min(
-        100,
-        Math.max(
-          5,
-          Math.round(((evolutionScore - currentStage.minScore) / (nextStage.minScore - currentStage.minScore)) * 100)
-        )
-      )
+    ? Math.min(100, Math.max(5, Math.round(((evolutionScore - currentStage.minScore) / (nextStage.minScore - currentStage.minScore)) * 100)))
     : 100;
 
-  // Earned Loyalty Badges
   const earnedBadges: { id: string; title: string; tone: string }[] = [
     { id: 'pioneer', title: 'کاوشگر مدار', tone: 'sky' },
   ];
@@ -205,9 +181,8 @@ function buildUserBundle(userId: number) {
   return {
     user: {
       ...user,
-      // Mask phone partially for UI hygiene while still showing user their verified status
-      phoneMasked: user.phone ? `${String(user.phone).slice(0, 6)}****${String(user.phone).slice(-2)}` : null,
-      phone: undefined,
+      // Phone number is NEVER exposed to clients or other users; only verification status is returned.
+      phoneMasked: null,
       age,
       isAdult: birthDateOver18,
       isAdultVerified,
@@ -270,7 +245,10 @@ function buildUserBundle(userId: number) {
 }
 
 export async function GET(req: NextRequest) {
+  const botUsername = getBotUsername();
+  const previewAvailable = process.env.NODE_ENV !== 'production';
   const auth = getAuthUser(req);
+
   if (!auth) {
     const db = getDb();
     const planetsRow = db.prepare("SELECT value_json FROM system_settings WHERE key = 'planets'").get() as
@@ -278,184 +256,185 @@ export async function GET(req: NextRequest) {
       | undefined;
     return NextResponse.json({
       authenticated: false,
+      isAdmin: false,
+      isPrimaryAdmin: false,
+      previewAvailable,
       planets: planetsRow ? JSON.parse(planetsRow.value_json) : [],
-      botUsername: process.env.TELEGRAM_BOT_USERNAME || 'MadarBot',
+      botUsername,
     });
   }
 
   const bundle = buildUserBundle(auth.id);
   if (!bundle) {
-    return NextResponse.json({ authenticated: false }, { status: 401 });
+    return NextResponse.json({ authenticated: false, botUsername, previewAvailable }, { status: 401 });
   }
+
+  const adminAuth = resolveAdminAuthority(auth);
+  const botSettings = getBotSettings();
+  const activeChannels = getForcedChannels().filter((c) => c.enabled);
+
+  let channelsVerified = activeChannels.length === 0;
+  let channels: { id: string; chatId: string; title: string; inviteUrl: string; joined: boolean }[] =
+    activeChannels.map((c) => ({
+      id: c.id,
+      chatId: c.chatId,
+      title: c.title,
+      inviteUrl: c.inviteUrl,
+      joined: false,
+    }));
+  if (activeChannels.length > 0 && auth.telegram_id && !adminAuth.isAdmin) {
+    const check = await verifyForcedChannelMembership(auth.telegram_id);
+    channelsVerified = check.allJoined;
+    channels = check.channels;
+  } else if (adminAuth.isAdmin) {
+    channelsVerified = true;
+  }
+
+  const phoneShared = Boolean(auth.phone_verified);
+  const needsContactShare = !adminAuth.isAdmin && botSettings.requirePhoneContact && !phoneShared;
+
   return NextResponse.json({
     authenticated: true,
     currentSessionId: auth.session_id,
-    botUsername: process.env.TELEGRAM_BOT_USERNAME || 'MadarBot',
+    botUsername,
+    previewAvailable,
+    isAdmin: adminAuth.isAdmin,
+    isPrimaryAdmin: adminAuth.isPrimaryAdmin,
+    adminRole: adminAuth.role,
+    onboarding: {
+      channelsVerified,
+      channels,
+      phoneShared,
+      needsContactShare,
+      onboardingCompleted: channelsVerified && !needsContactShare,
+    },
     ...bundle,
   });
 }
 
 export async function POST(req: NextRequest) {
   const ip = getClientIp(req);
-  const rl = checkRateLimit(`auth:${ip}`, 20, 10 * 60 * 1000);
+  const rl = checkRateLimit(`auth:${ip}`, 30, 10 * 60 * 1000);
   if (!rl.allowed) {
     return NextResponse.json(
-      { error: `تعداد تلاش‌های ورود بیش از حد مجاز است. لطفاً ${rl.retryAfterSec} ثانیه صبر کنید.` },
+      { error: `تعداد تلاش‌های ورود بیش از حد مجاز است. ${rl.retryAfterSec} ثانیه صبر کنید.` },
       { status: 429 }
     );
   }
 
+  if (process.env.NODE_ENV === 'production' && !isSessionSecretConfigured()) {
+    logSystemError('auth_session', 'SESSION_SECRET is not configured in production');
+    return NextResponse.json({ error: 'تنظیمات امنیتی نشست سرور کامل نیست.' }, { status: 503 });
+  }
+
   try {
-    const body = await req.json();
-    const parsed = AuthActionSchema.safeParse(body);
+    const body = await req.json().catch(() => null);
+    const parsed = TelegramAuthSchema.safeParse(body);
     if (!parsed.success) {
-      return NextResponse.json({ error: parsed.error.issues[0]?.message || 'اطلاعات ارسالی نامعتبر است.' }, { status: 400 });
-    }
-
-    const db = getDb();
-    const data = parsed.data;
-
-    if (data.mode === 'login') {
-      const uname = data.username.trim().toLowerCase().replace(/^@/, '');
-      const userRow = db
-        .prepare('SELECT id, password_hash, is_banned FROM users WHERE lower(username) = ? AND is_deleted = 0')
-        .get(uname) as { id: number; password_hash: string | null; is_banned: number } | undefined;
-
-      if (!userRow || !verifyPassword(data.password, userRow.password_hash)) {
-        return NextResponse.json({ error: 'نام کاربری یا رمز عبور مدار نادرست است.' }, { status: 401 });
-      }
-      if (userRow.is_banned) {
-        return NextResponse.json({ error: 'این حساب توسط مدیریت مدار مسدود شده است.' }, { status: 403 });
-      }
-
-      const sess = createSession(userRow.id, 'ورود با رمز مدار', ip);
-      return NextResponse.json({ token: sess.token, currentSessionId: sess.sessionId, ...buildUserBundle(userRow.id) });
-    }
-
-    if (data.mode === 'register') {
-      const uname = data.username.trim().toLowerCase();
-      const exists = db.prepare('SELECT id FROM users WHERE lower(username) = ?').get(uname);
-      if (exists) {
-        return NextResponse.json({ error: 'این نام کاربری قبلاً در مدار ثبت شده است.' }, { status: 409 });
-      }
-
-      const refCode = `ref_${uname.slice(0, 8)}${crypto.randomInt(10, 99)}`;
-      const initials = data.displayName.trim().slice(0, 2);
-      const pwHash = hashPassword(data.password);
-
-      let referrerId: number | null = null;
-      if (data.referralCode) {
-        const refRow = db
-          .prepare('SELECT id FROM users WHERE referral_code = ? AND is_deleted = 0')
-          .get(data.referralCode.trim()) as { id: number } | undefined;
-        if (refRow) referrerId = refRow.id;
-      }
-
-      const createTx = db.transaction(() => {
-        const res = db
-          .prepare(`
-            INSERT INTO users (username, display_name, password_hash, referral_code, referred_by_user_id, anon_slug)
-            VALUES (?, ?, ?, ?, ?, ?)
-          `)
-          .run(uname, data.displayName.trim(), pwHash, refCode, referrerId, uname);
-
-        const uid = Number(res.lastInsertRowid);
-        db.prepare(`
-          INSERT INTO user_profiles (user_id, avatar_initials, birth_date, city, province, interests, dating_enabled)
-          VALUES (?, ?, ?, ?, ?, ?, 0)
-        `).run(uid, initials, data.birthDate || '1999-01-01', data.city || 'تهران', data.city || 'تهران', JSON.stringify(['بازی گروهی', 'گفت‌وگو']));
-
-        db.prepare('INSERT INTO star_wallets (user_id, free_stars, paid_stars) VALUES (?, 100, 0)').run(uid);
-        db.prepare(
-          "INSERT INTO star_transactions (user_id, amount, star_bucket, tx_type, description) VALUES (?, 100, 'free', 'welcome_bonus', 'پاداش عضویت در مدار')"
-        ).run(uid);
-
-        db.prepare(
-          "INSERT INTO notifications (user_id, type, title, body) VALUES (?, 'welcome', 'به مدار خوش آمدی!', '۱۰۰ ستاره خوش‌آمدگویی به کیف‌پول تو واریز شد.')"
-        ).run(uid);
-
-        if (referrerId && referrerId !== uid) {
-          const econRow = db.prepare("SELECT value_json FROM system_settings WHERE key = 'economy'").get() as
-            | { value_json: string }
-            | undefined;
-          const rewardStars = econRow ? Number(JSON.parse(econRow.value_json).referralRewardStars || 50) : 50;
-          db.prepare(
-            "INSERT INTO referral_events (referrer_user_id, referred_user_id, status, reward_stars) VALUES (?, ?, 'verified', ?)"
-          ).run(referrerId, uid, rewardStars);
-          adjustStarsAtomic(referrerId, rewardStars, 'free', 'referral_reward', `پاداش دعوت موفق @${uname}`, String(uid));
-          db.prepare(
-            "INSERT INTO notifications (user_id, type, title, body) VALUES (?, 'referral', 'دعوت موفق ثبت شد', ?)"
-          ).run(referrerId, `دوست تو @${uname} ثبت‌نام کرد و ${rewardStars} ستاره به کیف‌پولت اضافه شد.`);
-        }
-
-        return uid;
-      });
-
-      const newUserId = createTx();
-      const sess = createSession(newUserId, 'ثبت‌نام جدید مدار', ip);
       return NextResponse.json(
-        { token: sess.token, currentSessionId: sess.sessionId, ...buildUserBundle(newUserId) },
-        { status: 201 }
+        { error: 'ورود به مدار فقط از طریق حساب تلگرام (Telegram Mini App) امکان‌پذیر است.' },
+        { status: 400 }
       );
     }
 
-    if (data.mode === 'telegram') {
-      const botToken = process.env.TELEGRAM_BOT_TOKEN;
-      if (!botToken) {
-        return NextResponse.json(
-          {
-            error:
-              'متغیر TELEGRAM_BOT_TOKEN روی سرور تنظیم نشده است. برای احراز هویت واقعی تلگرام، توکن ربات را در متغیرهای محیطی سرور قرار دهید یا از ورود مستقل مدار استفاده کنید.',
-          },
-          { status: 503 }
-        );
-      }
-
-      const verified = verifyTelegramInitData(data.initData, botToken);
-      if (!verified.valid || !verified.user) {
-        return NextResponse.json({ error: verified.error || 'امضای امنیتی Telegram initData نامعتبر است.' }, { status: 401 });
-      }
-
-      const tgId = String(verified.user.id);
-      let existing = db.prepare('SELECT id, is_banned FROM users WHERE telegram_id = ? AND is_deleted = 0').get(tgId) as
-        | { id: number; is_banned: number }
-        | undefined;
-
-      if (existing?.is_banned) {
-        return NextResponse.json({ error: 'این حساب تلگرام در مدار مسدود شده است.' }, { status: 403 });
-      }
-
-      let uid: number;
-      if (existing) {
-        uid = existing.id;
-      } else {
-        const baseName = (verified.user.username || `tg_${tgId}`).toLowerCase().replace(/[^a-z0-9_]/g, '').slice(0, 22);
-        const uniqueUname = `${baseName}_${crypto.randomInt(10, 99)}`;
-        const display = [verified.user.first_name, verified.user.last_name].filter(Boolean).join(' ') || 'کاربر مدار';
-        const refCode = `ref_${tgId.slice(-6)}${crypto.randomInt(10, 99)}`;
-
-        const createTgTx = db.transaction(() => {
-          const res = db
-            .prepare(`
-              INSERT INTO users (telegram_id, username, display_name, referral_code, anon_slug)
-              VALUES (?, ?, ?, ?, ?)
-            `)
-            .run(tgId, uniqueUname, display, refCode, uniqueUname);
-          const id = Number(res.lastInsertRowid);
-          db.prepare('INSERT INTO user_profiles (user_id, avatar_initials) VALUES (?, ?)').run(id, display.slice(0, 2));
-          db.prepare('INSERT INTO star_wallets (user_id, free_stars, paid_stars) VALUES (?, 100, 0)').run(id);
-          return id;
-        });
-        uid = createTgTx();
-      }
-
-      const sess = createSession(uid, 'Telegram Mini App', ip);
-      return NextResponse.json({ token: sess.token, currentSessionId: sess.sessionId, ...buildUserBundle(uid) });
+    const botToken = process.env.TELEGRAM_BOT_TOKEN?.trim();
+    if (!botToken) {
+      return NextResponse.json(
+        { error: 'اتصال ربات تلگرام روی سرور پیکربندی نشده است.' },
+        { status: 503 }
+      );
     }
 
-    return NextResponse.json({ error: 'حالت ورود نامعتبر است.' }, { status: 400 });
-  } catch {
-    return NextResponse.json({ error: 'خطای داخلی در پردازش احراز هویت.' }, { status: 500 });
+    const verified = verifyTelegramInitData(parsed.data.initData, botToken);
+    if (!verified.valid || !verified.user) {
+      return NextResponse.json(
+        { error: verified.error || 'امضای امنیتی Telegram initData معتبر نیست.' },
+        { status: 401 }
+      );
+    }
+
+    // If initData does not carry photo_url, optionally resolve via Bot API avatar proxy
+    let fallbackPhoto: string | null = null;
+    if (!verified.user.photo_url) {
+      fallbackPhoto = await fetchTelegramAvatarProxyUrl(verified.user.id);
+    }
+
+    const refFromStart =
+      parsed.data.referralCode ||
+      (verified.startParam?.startsWith('ref_') ? verified.startParam : undefined);
+
+    const upserted = upsertTelegramUser(verified.user, {
+      referralCode: refFromStart,
+      updateLoginTime: true,
+      resolvedPhotoUrl: fallbackPhoto,
+    });
+
+    if (upserted.isBanned) {
+      return NextResponse.json({ error: 'این حساب تلگرام در مدار مسدود شده است.' }, { status: 403 });
+    }
+
+    const sess = createSession(upserted.userId, 'Telegram Mini App', ip);
+    const bundle = buildUserBundle(upserted.userId);
+    const db = getDb();
+    const userRow = db
+      .prepare('SELECT id, telegram_id, username, display_name, role, subscription_tier, phone_verified, onboarding_completed, is_banned FROM users WHERE id = ?')
+      .get(upserted.userId) as {
+      id: number;
+      telegram_id: string | null;
+      username: string;
+      display_name: string;
+      role: string;
+      subscription_tier: string;
+      phone_verified: number;
+      onboarding_completed: number;
+      is_banned: number;
+    };
+
+    const adminAuth = resolveAdminAuthority({ ...userRow, session_id: sess.sessionId });
+    const botSettings = getBotSettings();
+    const activeChannels = getForcedChannels().filter((c) => c.enabled);
+
+    let channelsVerified = activeChannels.length === 0 || adminAuth.isAdmin;
+    let channels: { id: string; chatId: string; title: string; inviteUrl: string; joined: boolean }[] =
+      activeChannels.map((c) => ({
+        id: c.id,
+        chatId: c.chatId,
+        title: c.title,
+        inviteUrl: c.inviteUrl,
+        joined: false,
+      }));
+    if (activeChannels.length > 0 && !adminAuth.isAdmin) {
+      const check = await verifyForcedChannelMembership(verified.user.id);
+      channelsVerified = check.allJoined;
+      channels = check.channels;
+      if (channelsVerified) {
+        db.prepare("UPDATE users SET channel_verified_at = datetime('now') WHERE id = ?").run(upserted.userId);
+      }
+    }
+
+    const phoneShared = Boolean(userRow.phone_verified);
+    const needsContactShare = !adminAuth.isAdmin && botSettings.requirePhoneContact && !phoneShared;
+
+    return NextResponse.json({
+      token: sess.token,
+      currentSessionId: sess.sessionId,
+      botUsername: getBotUsername(),
+      previewAvailable: process.env.NODE_ENV !== 'production',
+      isAdmin: adminAuth.isAdmin,
+      isPrimaryAdmin: adminAuth.isPrimaryAdmin,
+      adminRole: adminAuth.role,
+      onboarding: {
+        channelsVerified,
+        channels,
+        phoneShared,
+        needsContactShare,
+        onboardingCompleted: channelsVerified && !needsContactShare,
+      },
+      ...bundle,
+    });
+  } catch (err) {
+    logSystemError('auth_session_post', 'Telegram auth failed', err instanceof Error ? err.message : String(err));
+    return NextResponse.json({ error: 'خطای داخلی در پردازش ورود تلگرام.' }, { status: 500 });
   }
 }
 
@@ -468,14 +447,14 @@ export async function DELETE(req: NextRequest) {
 
   if (scope === 'others') {
     db.prepare('UPDATE user_sessions SET revoked = 1 WHERE user_id = ? AND id != ?').run(auth.id, auth.session_id);
-    return NextResponse.json({ ok: true, message: 'تمام نشست‌های دیگر با موفقیت بسته شدند.' });
+    return NextResponse.json({ ok: true, message: 'تمام نشست‌های دیگر بسته شدند.' });
   }
 
   if (scope === 'delete_account') {
     db.transaction(() => {
       db.prepare('UPDATE user_sessions SET revoked = 1 WHERE user_id = ?').run(auth.id);
       db.prepare(
-        "UPDATE users SET is_deleted = 1, phone = NULL, password_hash = NULL, display_name = 'کاربر حذف‌شده' WHERE id = ?"
+        "UPDATE users SET is_deleted = 1, phone = NULL, phone_verified = 0, password_hash = NULL, display_name = 'کاربر حذف‌شده' WHERE id = ?"
       ).run(auth.id);
     })();
     return NextResponse.json({ ok: true, message: 'حساب کاربری و اطلاعات خصوصی شما حذف شد.' });

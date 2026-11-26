@@ -1,22 +1,33 @@
 'use client';
 
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
+import Link from 'next/link';
+import { useRouter } from 'next/navigation';
 import { motion, AnimatePresence } from 'motion/react';
 import {
+  CheckCircle2,
   Compass,
   ExternalLink,
   Gamepad2,
   Heart,
   Mail,
+  Phone,
   RefreshCw,
   Send,
   Sparkles,
   Star,
   User,
+  Users,
   Volume2,
   VolumeX,
 } from 'lucide-react';
-import { getTelegramWebApp, initTelegramMiniApp, triggerHaptic } from '@/lib/telegram-webapp';
+import {
+  getTelegramWebApp,
+  initTelegramMiniApp,
+  openTelegramUrl,
+  requestTelegramContact,
+  triggerHaptic,
+} from '@/lib/telegram-webapp';
 import { madarSound } from './SoundFX';
 import GalaxyHub from './GalaxyHub';
 import VenusDating from './VenusDating';
@@ -25,13 +36,13 @@ import NeptuneWhisper from './NeptuneWhisper';
 import SaturnGroupHub from './SaturnGroupHub';
 import StarEconomy from './StarEconomy';
 import ProfileHub from './ProfileHub';
-import AdminConsole from './AdminConsole';
 import type {
   GameSubTab,
   MadarUser,
   MainView,
   MissionItem,
   NotificationItem,
+  OnboardingState,
   PlanetConfig,
   UserSessionItem,
 } from './types';
@@ -58,6 +69,8 @@ function shouldDefaultToLiteMode(): boolean {
 }
 
 export default function MadarApp() {
+  const router = useRouter();
+
   // Auth Bearer token stored strictly in React memory (never localStorage/sessionStorage)
   const [token, setToken] = useState<string | null>(null);
   const [currentSessionId, setCurrentSessionId] = useState<string | null>(null);
@@ -66,42 +79,78 @@ export default function MadarApp() {
   const [notifications, setNotifications] = useState<NotificationItem[]>([]);
   const [planets, setPlanets] = useState<PlanetConfig[]>([]);
   const [missions, setMissions] = useState<MissionItem[]>([]);
-  const [botUsername, setBotUsername] = useState('MadarBot');
+  const [botUsername, setBotUsername] = useState('m4d4rbot');
+  const [previewAvailable, setPreviewAvailable] = useState(false);
+
+  // Onboarding state (forced channels -> one-time official Telegram contact share)
+  const [onboarding, setOnboarding] = useState<OnboardingState | null>(null);
+  const [checkingChannels, setCheckingChannels] = useState(false);
+  const [channelNotice, setChannelNotice] = useState<string | null>(null);
+  const [contactState, setContactState] = useState<'idle' | 'waiting' | 'verified' | 'declined'>('idle');
+  const [contactNotice, setContactNotice] = useState<string | null>(null);
+  const pollTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const [view, setView] = useState<MainView>('home');
   const [gameSubTab, setGameSubTab] = useState<GameSubTab | null>(null);
   const [liteMode, setLiteMode] = useState(false);
-  const [soundEnabled, setSoundEnabled] = useState(false); // Muted at start per user preference
+  const [soundEnabled, setSoundEnabled] = useState(false);
   const [booting, setBooting] = useState(true);
   const [authError, setAuthError] = useState<string | null>(null);
 
-  const fetchSessionBundle = useCallback(async (activeToken: string | null) => {
-    const res = await fetch('/api/auth/session', {
-      headers: activeToken ? { Authorization: `Bearer ${activeToken}` } : {},
-    });
-    const data = await res.json();
-    setPlanets(data.planets || []);
-    setBotUsername(data.botUsername || 'MadarBot');
-
-    if (data.authenticated && data.user) {
-      setUser(data.user);
-      setSessions(data.sessions || []);
-      setNotifications(data.notifications || []);
-      setCurrentSessionId(data.currentSessionId || null);
-
-      const starRes = await fetch('/api/stars', {
-        headers: { Authorization: `Bearer ${activeToken}` },
-      });
-      if (starRes.ok) {
-        const starData = await starRes.json();
-        setMissions(starData.missions || []);
-      }
-    } else {
-      setUser(null);
-      setSessions([]);
-      setNotifications([]);
+  const clearContactPoll = useCallback(() => {
+    if (pollTimerRef.current) {
+      clearInterval(pollTimerRef.current);
+      pollTimerRef.current = null;
     }
   }, []);
+
+  useEffect(() => {
+    return () => clearContactPoll();
+  }, [clearContactPoll]);
+
+  const fetchSessionBundle = useCallback(
+    async (activeToken: string | null) => {
+      const res = await fetch('/api/auth/session', {
+        headers: activeToken ? { Authorization: `Bearer ${activeToken}` } : {},
+      });
+      const data = await res.json();
+      setPlanets(data.planets || []);
+      setBotUsername(data.botUsername || 'm4d4rbot');
+      setPreviewAvailable(Boolean(data.previewAvailable));
+
+      if (data.authenticated && data.user) {
+        const asUser =
+          typeof window !== 'undefined' &&
+          new URLSearchParams(window.location.search).get('asUser') === '1';
+
+        // Verified primary/delegated admin opens directly into the hidden private /admin panel
+        if (data.isAdmin && !asUser) {
+          router.replace('/admin');
+          return;
+        }
+
+        setUser(data.user);
+        setSessions(data.sessions || []);
+        setNotifications(data.notifications || []);
+        setCurrentSessionId(data.currentSessionId || null);
+        setOnboarding(data.onboarding || null);
+
+        const starRes = await fetch('/api/stars', {
+          headers: { Authorization: `Bearer ${activeToken}` },
+        });
+        if (starRes.ok) {
+          const starData = await starRes.json();
+          setMissions(starData.missions || []);
+        }
+      } else {
+        setUser(null);
+        setSessions([]);
+        setNotifications([]);
+        setOnboarding(null);
+      }
+    },
+    [router]
+  );
 
   const authenticateViaTelegram = useCallback(async () => {
     setAuthError(null);
@@ -114,20 +163,46 @@ export default function MadarApp() {
       });
       const data = await res.json();
       if (res.ok && data.token) {
+        const asUser =
+          typeof window !== 'undefined' &&
+          new URLSearchParams(window.location.search).get('asUser') === '1';
+
+        if (data.isAdmin && !asUser) {
+          router.replace('/admin');
+          return true;
+        }
+
         setToken(data.token);
         setCurrentSessionId(data.currentSessionId);
-        await fetchSessionBundle(data.token);
+        setBotUsername(data.botUsername || 'm4d4rbot');
+        setPreviewAvailable(Boolean(data.previewAvailable));
+        if (data.user) {
+          setUser(data.user);
+          setSessions(data.sessions || []);
+          setNotifications(data.notifications || []);
+          setPlanets(data.planets || []);
+          setOnboarding(data.onboarding || null);
+          const starRes = await fetch('/api/stars', {
+            headers: { Authorization: `Bearer ${data.token}` },
+          });
+          if (starRes.ok) {
+            const starData = await starRes.json();
+            setMissions(starData.missions || []);
+          }
+        } else {
+          await fetchSessionBundle(data.token);
+        }
         return true;
       }
-      setAuthError(data.error || 'تأیید امضای تلگرام ناموفق بود.');
+      setAuthError(data.error || 'تأیید ورود از طریق تلگرام ناموفق بود.');
       await fetchSessionBundle(null);
       return false;
     }
     await fetchSessionBundle(null);
     return false;
-  }, [fetchSessionBundle]);
+  }, [fetchSessionBundle, router]);
 
-  // Bootstrap: real Telegram Mini App auth ONLY (zero demo_enter auto-login!)
+  // Bootstrap: Telegram Mini App auth ONLY
   useEffect(() => {
     let active = true;
     async function boot() {
@@ -143,8 +218,7 @@ export default function MadarApp() {
           tabParam === 'whisper' ||
           tabParam === 'profile' ||
           tabParam === 'saturn' ||
-          tabParam === 'shop' ||
-          tabParam === 'admin'
+          tabParam === 'shop'
         ) {
           setView(tabParam);
         }
@@ -206,12 +280,6 @@ export default function MadarApp() {
     }
   }
 
-  async function handleAuthSuccess(newToken: string, sessionId: string) {
-    setToken(newToken);
-    setCurrentSessionId(sessionId);
-    await fetchSessionBundle(newToken);
-  }
-
   async function handleLogout(scope: 'current' | 'others' | 'delete_account') {
     if (!token) return;
     const res = await fetch(`/api/auth/session?scope=${scope}`, {
@@ -227,8 +295,112 @@ export default function MadarApp() {
         setUser(null);
         setSessions([]);
         setNotifications([]);
+        setOnboarding(null);
       }
     }
+  }
+
+  // Step A: Verify forced channel membership server-side
+  async function handleCheckChannels() {
+    if (!token) return;
+    setCheckingChannels(true);
+    setChannelNotice(null);
+    try {
+      const res = await fetch('/api/auth/onboarding', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ action: 'check_channels' }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setChannelNotice(data.error || 'بررسی عضویت ناموفق بود.');
+        return;
+      }
+      if (data.channelsVerified) {
+        triggerHaptic('medium');
+        await fetchSessionBundle(token);
+      } else {
+        triggerHaptic('heavy');
+        setOnboarding((prev) =>
+          prev
+            ? { ...prev, channelsVerified: false, channels: data.channels || prev.channels }
+            : prev
+        );
+        setChannelNotice(
+          data.error || 'هنوز عضو تمام کانال‌ها نشده‌اید. پس از عضویت دوباره بررسی کنید.'
+        );
+      }
+    } finally {
+      setCheckingChannels(false);
+    }
+  }
+
+  // Poll server to confirm official Telegram webhook saved the shared contact
+  const checkContactStatusOnce = useCallback(async () => {
+    if (!token) return false;
+    const res = await fetch('/api/auth/onboarding', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ action: 'check_contact_status' }),
+    });
+    const data = await res.json();
+    if (res.ok && data.phoneShared) {
+      clearContactPoll();
+      setContactState('verified');
+      setContactNotice('شماره با موفقیت ثبت شد');
+      triggerHaptic('medium');
+      setTimeout(() => {
+        void fetchSessionBundle(token);
+      }, 900);
+      return true;
+    }
+    return false;
+  }, [clearContactPoll, fetchSessionBundle, token]);
+
+  // Step B: Official Telegram requestContact() popup — zero manual phone input
+  async function handleShareOfficialContact() {
+    if (!token) return;
+    setContactNotice(null);
+    clearContactPoll();
+
+    const result = await requestTelegramContact();
+    if (!result.supported) {
+      setContactState('idle');
+      setContactNotice(
+        'برای اشتراک‌گذاری شماره، لطفاً اپلیکیشن تلگرام خود را به‌روزرسانی کرده و مدار را از ربات باز کنید.'
+      );
+      return;
+    }
+
+    if (!result.shared) {
+      setContactState('declined');
+      await fetch('/api/auth/onboarding', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ action: 'decline_contact' }),
+      }).catch(() => {});
+      setContactNotice('اشتراک‌گذاری شماره انجام نشد. هر زمان آماده بودید دوباره تلاش کنید.');
+      return;
+    }
+
+    // Telegram accepted contact sharing — webhook receives and validates ownership server-side
+    setContactState('waiting');
+    setContactNotice('در حال ثبت شماره از طریق تلگرام...');
+    const immediate = await checkContactStatusOnce();
+    if (immediate) return;
+
+    let attempts = 0;
+    pollTimerRef.current = setInterval(async () => {
+      attempts += 1;
+      const done = await checkContactStatusOnce();
+      if (done || attempts >= 10) {
+        clearContactPoll();
+        if (!done) {
+          setContactState('idle');
+          setContactNotice('اگر شماره را در تلگرام تأیید کردید، دکمه بررسی وضعیت را بزنید.');
+        }
+      }
+    }, 1500);
   }
 
   const navItems: { id: MainView; label: string; icon: React.ComponentType<{ className?: string }> }[] = [
@@ -239,7 +411,7 @@ export default function MadarApp() {
     { id: 'profile', label: 'پروفایل', icon: User },
   ];
 
-  // Direct Telegram Mini App Entry Gate when opened outside Telegram without an authenticated session
+  // 1) Entry gate outside Telegram (clean minimal Persian UX, zero technical jargon)
   if (!booting && !user) {
     return (
       <div className="min-h-[100dvh] bg-[#0e1621] text-slate-100 flex items-center justify-center p-4">
@@ -249,14 +421,14 @@ export default function MadarApp() {
           </div>
 
           <div className="space-y-2">
-            <h1 className="text-2xl font-bold text-white">مدار | MADAR</h1>
+            <h1 className="text-2xl font-bold text-white">مدار</h1>
             <p className="text-sm text-slate-300 leading-relaxed">
-              برای حفظ امنیت هویت و جلوگیری از ورود آزمایشی، ورود به مدار منحصراً از طریق Telegram Mini App انجام می‌شود.
+              برای ورود به مدار، ربات تلگرام را باز کنید.
             </p>
           </div>
 
           {authError && (
-            <div className="rounded-xl border border-rose-500/35 bg-rose-500/10 px-4 py-3 text-xs text-rose-200">
+            <div className="rounded-xl border border-rose-500/35 bg-rose-500/10 px-4 py-3 text-xs text-rose-200 leading-relaxed">
               {authError}
             </div>
           )}
@@ -269,7 +441,7 @@ export default function MadarApp() {
               className="w-full inline-flex items-center justify-center gap-2 rounded-xl bg-[#38bdf8] px-5 py-3.5 text-sm font-bold text-slate-950 hover:brightness-110 transition-all min-h-[48px]"
             >
               <ExternalLink className="w-4 h-4 shrink-0" />
-              <span>باز کردن در تلگرام (@{botUsername})</span>
+              <span>ورود به مدار</span>
             </a>
 
             <button
@@ -278,13 +450,146 @@ export default function MadarApp() {
               className="w-full inline-flex items-center justify-center gap-2 rounded-xl border border-[#23303e] bg-[#0e1621] px-4 py-3 text-xs font-semibold text-slate-200 hover:border-[#38bdf8]/50 transition-colors min-h-[44px]"
             >
               <RefreshCw className="w-3.5 h-3.5 shrink-0" />
-              <span>تلاش مجدد برای اتصال به تلگرام</span>
+              <span>تلاش مجدد</span>
             </button>
+
+            {previewAvailable && (
+              <Link
+                href="/preview"
+                className="w-full inline-flex items-center justify-center gap-2 rounded-xl border border-amber-400/35 bg-amber-400/10 px-4 py-3 text-xs font-semibold text-amber-200 hover:bg-amber-400/20 transition-colors min-h-[44px]"
+              >
+                <Sparkles className="w-3.5 h-3.5 shrink-0" />
+                <span>پیش‌نمایش محیط توسعه</span>
+              </Link>
+            )}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // 2) Forced Channel Membership Gate (Step A inside Telegram)
+  if (!booting && user && onboarding && !onboarding.channelsVerified) {
+    return (
+      <div className="min-h-[100dvh] bg-[#0e1621] text-slate-100 flex items-center justify-center p-4">
+        <div className="w-full max-w-md madar-glass rounded-3xl p-6 sm:p-8 space-y-5">
+          <div className="text-center space-y-2">
+            <div className="w-14 h-14 rounded-2xl bg-[#38bdf8]/15 border border-[#38bdf8]/35 mx-auto flex items-center justify-center">
+              <Users className="w-6 h-6 text-[#38bdf8]" />
+            </div>
+            <h1 className="text-xl font-bold text-white">عضویت در کانال‌ها</h1>
+            <p className="text-xs text-slate-300 leading-relaxed">
+              برای ادامه ورود به مدار، ابتدا در کانال‌های زیر عضو شوید و سپس دکمه بررسی عضویت را بزنید.
+            </p>
           </div>
 
-          <p className="text-[11px] text-slate-500">
-            احراز هویت واقعی با امضای رمزنگاری‌شده Telegram initData
-          </p>
+          <div className="space-y-2.5">
+            {onboarding.channels.map((ch) => (
+              <button
+                key={ch.id}
+                type="button"
+                onClick={() => openTelegramUrl(ch.inviteUrl)}
+                className="w-full flex items-center justify-between gap-3 rounded-xl border border-[#23303e] bg-[#0e1621] px-4 py-3.5 text-right hover:border-[#38bdf8]/50 transition-colors min-h-[50px]"
+              >
+                <div className="min-w-0">
+                  <p className="text-sm font-semibold text-white truncate">{ch.title}</p>
+                  <p className="text-[11px] text-slate-400">
+                    {ch.joined ? 'عضو هستید' : 'برای عضویت لمس کنید'}
+                  </p>
+                </div>
+                {ch.joined ? (
+                  <CheckCircle2 className="w-5 h-5 text-emerald-400 shrink-0" />
+                ) : (
+                  <ExternalLink className="w-4 h-4 text-[#38bdf8] shrink-0" />
+                )}
+              </button>
+            ))}
+          </div>
+
+          {channelNotice && (
+            <div className="rounded-xl border border-amber-400/35 bg-amber-400/10 px-4 py-3 text-xs text-amber-200 leading-relaxed text-center">
+              {channelNotice}
+            </div>
+          )}
+
+          <button
+            type="button"
+            disabled={checkingChannels}
+            onClick={() => void handleCheckChannels()}
+            className="w-full inline-flex items-center justify-center gap-2 rounded-xl bg-[#38bdf8] px-5 py-3.5 text-sm font-bold text-slate-950 hover:brightness-110 disabled:opacity-60 transition-all min-h-[48px]"
+          >
+            <RefreshCw className={`w-4 h-4 shrink-0 ${checkingChannels ? 'animate-spin' : ''}`} />
+            <span>{checkingChannels ? 'در حال بررسی...' : 'بررسی عضویت'}</span>
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  // 3) One-Time Official Telegram Phone Sharing Gate (Step B — strictly after forced channels)
+  if (!booting && user && onboarding && onboarding.channelsVerified && onboarding.needsContactShare) {
+    return (
+      <div className="min-h-[100dvh] bg-[#0e1621] text-slate-100 flex items-center justify-center p-4">
+        <div className="w-full max-w-md madar-glass rounded-3xl p-6 sm:p-8 space-y-6 text-center">
+          <div
+            className={`w-14 h-14 rounded-2xl mx-auto flex items-center justify-center border ${
+              contactState === 'verified'
+                ? 'bg-emerald-400/15 border-emerald-400/40 text-emerald-300'
+                : 'bg-[#38bdf8]/15 border-[#38bdf8]/35 text-[#38bdf8]'
+            }`}
+          >
+            {contactState === 'verified' ? (
+              <CheckCircle2 className="w-7 h-7" />
+            ) : (
+              <Phone className="w-6 h-6" />
+            )}
+          </div>
+
+          <div className="space-y-2">
+            <h1 className="text-xl font-bold text-white">
+              {contactState === 'verified' ? 'شماره با موفقیت ثبت شد' : 'اشتراک‌گذاری شماره'}
+            </h1>
+            <p className="text-xs sm:text-sm text-slate-300 leading-relaxed">
+              {contactState === 'verified'
+                ? 'در حال ورود به مدار...'
+                : 'برای تکمیل ورود اولیه و جلوگیری از حساب‌های تکراری، شماره تلگرام خود را یک‌بار از پنجره رسمی تلگرام به اشتراک بگذارید. شماره شما به هیچ کاربری نمایش داده نمی‌شود.'}
+            </p>
+          </div>
+
+          {contactNotice && (
+            <div
+              className={`rounded-xl px-4 py-3 text-xs leading-relaxed border ${
+                contactState === 'verified'
+                  ? 'border-emerald-400/40 bg-emerald-400/10 text-emerald-200'
+                  : 'border-amber-400/35 bg-amber-400/10 text-amber-200'
+              }`}
+            >
+              {contactNotice}
+            </div>
+          )}
+
+          {contactState !== 'verified' && (
+            <div className="space-y-2.5">
+              <button
+                type="button"
+                disabled={contactState === 'waiting'}
+                onClick={() => void handleShareOfficialContact()}
+                className="w-full inline-flex items-center justify-center gap-2 rounded-xl bg-[#38bdf8] px-5 py-3.5 text-sm font-bold text-slate-950 hover:brightness-110 disabled:opacity-60 transition-all min-h-[48px]"
+              >
+                <Phone className="w-4 h-4 shrink-0" />
+                <span>{contactState === 'waiting' ? 'در حال ثبت...' : 'اشتراک‌گذاری شماره'}</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => void checkContactStatusOnce()}
+                className="w-full inline-flex items-center justify-center gap-2 rounded-xl border border-[#23303e] bg-[#0e1621] px-4 py-3 text-xs font-semibold text-slate-200 hover:border-[#38bdf8]/50 transition-colors min-h-[44px]"
+              >
+                <RefreshCw className="w-3.5 h-3.5 shrink-0" />
+                <span>بررسی وضعیت ثبت شماره</span>
+              </button>
+            </div>
+          )}
         </div>
       </div>
     );
@@ -449,21 +754,16 @@ export default function MadarApp() {
                   user={user}
                   sessions={sessions}
                   currentSessionId={currentSessionId}
-                  onAuthSuccess={handleAuthSuccess}
                   onRefreshUser={() => fetchSessionBundle(token)}
                   onLogout={handleLogout}
                 />
-              )}
-
-              {view === 'admin' && (
-                <AdminConsole onPlanetsUpdated={() => fetchSessionBundle(token)} />
               )}
             </motion.div>
           </AnimatePresence>
         )}
       </main>
 
-      {/* Quiet Desktop Footer */}
+      {/* Quiet Desktop Footer — ZERO public admin link */}
       <footer className="hidden md:block border-t border-[#23303e] py-4 px-5 text-xs text-slate-500">
         <div className="max-w-5xl mx-auto flex items-center justify-between gap-4">
           <span>مدار | MADAR</span>
@@ -473,9 +773,6 @@ export default function MadarApp() {
             </button>
             <button type="button" onClick={() => handleNavigate('shop')} className="hover:text-amber-300">
               فروشگاه ستاره
-            </button>
-            <button type="button" onClick={() => handleNavigate('admin')} className="hover:text-purple-300">
-              پنل مدیریت
             </button>
           </div>
         </div>
